@@ -32,3 +32,8 @@ pearson_distance <- function(data_matrix) {
   dist_matrix[dist_matrix < 0] <- 0
   return(as.dist(dist_matrix))
 }
+
+angular_distance <- function(data_matrix) {
+  X <- as.matrix(data_matrix)
+  pearson <- cor()
+}

@@ -1,26 +1,32 @@
 library(igraph)
+library(fields)
 library(visNetwork)
 library(htmltools)
 library(htmlwidgets)
 
 # construction
-create_mapper_graph <- function(mapper_obj, lens, original_data, groups = NULL) {
+create_mapper_graph <- function(mapper_obj, colourisation, original_data, groups = NULL) {
   # create a mapper graph, with node sizes, colours, and the option for nodes to be pie charts
   g <- graph_from_adjacency_matrix(mapper_obj$adjacency, mode = "undirected")
   
   # node size is the cluster size
   V(g)$size <- sapply(mapper_obj$nodes, length)
   
+  colourisation <- as.matrix(colourisation)
   # node colour is the lens value (by default)
-  mean_lens_vals <- sapply(mapper_obj$nodes, function(indices)
-    return(mean(lens[indices])))
-  val_range <- max(mean_lens_vals) - min(mean_lens_vals)
+  # Euclidean distance magnitude from the center across dimensions
+  mean_colours <- sapply(mapper_obj$nodes, function(indices) {
+    # column averages for this specific node block
+    dim_means <- colMeans(colourisation[indices, , drop = FALSE])
+    return(sqrt(sum(dim_means^2)))
+  })
+  val_range <- max(mean_colours) - min(mean_colours)
   
   # avoid division by zero if all mean lens values are the same (range = 0)
   if (val_range == 0) {
-    scaled_vals <- rep(0.5, length(mean_lens_vals)) # no variance
+    scaled_vals <- rep(0.5, length(mean_colours)) # no variance
   } else {
-    scaled_vals <- (mean_lens_vals - min(mean_lens_vals)) / val_range
+    scaled_vals <- (mean_colours - min(mean_colours)) / val_range
   }
   
   # colour gradient from blue to yellow to red
@@ -42,20 +48,45 @@ create_mapper_graph <- function(mapper_obj, lens, original_data, groups = NULL) 
     V(g)$pie <- pie_data
     V(g)$pie.color <- list(groups$cat_colour)
   }
+
   return(g)
+}
+
+plot_mapper_graph <- function(
+  graph, colourisation, graph_layout = layout_with_kk, legend = TRUE, legend_title = "PCA Components"
+) {
+  z_limits <- c(min(colourisation), max(colourisation))
+  colour_palette_fn <- colorRampPalette(c("blue", "yellow", "red"))
+  par(mar = c(1, 1, 1, 4))
+  plot(graph, layout = graph_layout(graph))
+  if (legend) {
+    image.plot(
+      legend.only = TRUE,
+      zlim = z_limits,
+      col = colour_palette_fn(100),
+      legend.width = 1.5,
+      legend.shrink = 0.5,
+      legend.args = list(
+        text = legend_title,
+        side = 3,
+        line = 1,
+        cex = 0.8
+      )
+    )
+  }
 }
 
 add_continuous_legend <- function(network_obj,
                                   title = "Continuous Filter",
-                                  colors = c("blue", "yellow", "red"),
+                                  colours = c("blue", "yellow", "red"),
                                   labels = c("Low", "High")) {
   # css gradient string
-  gradient_string <- paste(colors, collapse = ", ")
+  gradient_string <- paste(colours, collapse = ", ")
   gradient_css <- sprintf("linear-gradient(to right, %s)", gradient_string)
   
   # html widget to go in visualisation
-  color_bar <- tags$div(
-    style = "position: absolute; bottom: 30px; left: 30px; z-index: 1000; background: rgba(255,255,255,0.9); padding: 12px; border: 1px solid #ccc; border-radius: 5px; font-family: sans-serif; box-shadow: 2px 2px 5px rgba(0,0,0,0.1);",
+  colour_bar <- tags$div(
+    style = "position: absolute; top: 30px; z-index: 1000; background: rgba(255,255,255,0.9); padding: 12px; border: 1px solid #ccc; border-radius: 5px; font-family: sans-serif; box-shadow: 2px 2px 5px rgba(0,0,0,0.1);",
     tags$b(title),
     tags$div(
       style = paste0(
@@ -64,11 +95,22 @@ add_continuous_legend <- function(network_obj,
         "; margin-top: 8px; margin-bottom: 5px; border-radius: 3px;"
       )
     ),
-    tags$div(style = "display: flex; justify-content: space-between; font-size: 12px; color: #333; font-weight: bold;", tags$span(labels[1]), tags$span(labels[2]))
+    tags$div(
+      style = "display: flex; justify-content: space-between; font-size: 12px; color: #333; font-weight: bold;",
+      tags$span(labels[1]),
+      tags$span(labels[2])
+    )
   )
   
   # add to visualisation
-  return(htmlwidgets::appendContent(network_obj, color_bar))
+  # relative positions to avoid locked legend in previews
+  combined_html <- tags$div(
+    style = "position: relative; width: 100%; height: 800px; border: 1px solid #f0f0f0;",
+    network_obj,
+    colour_bar
+  )
+  # render correctly
+  return(browsable(combined_html))
 }
 
 create_vis_graph <- function(graph, mapper_obj, original_data) {
@@ -138,21 +180,14 @@ create_vis_graph <- function(graph, mapper_obj, original_data) {
       ),
       nodesIdSelection = TRUE,
       # double-click cluster to collapse
-      collapse = TRUE
+      collapse = TRUE,
+      autoResize = TRUE,
+      clickToUse = TRUE
     ) |>
     visInteraction(navigationButtons = TRUE, tooltipDelay = 200)
   return(network)
 }
 
 save_vis_graph <- function(vis_graph, filename) {
-  saveWidget(
-    vis_graph %>%
-      visOptions(
-        highlightNearest = TRUE,
-        nodesIdSelection = TRUE,
-        autoResize = TRUE,
-        clickToUse = TRUE,
-      ),
-    file = filename
-  )
+  save_html(vis_graph, file = filename)
 }

@@ -5,6 +5,7 @@ density_estimation <- function(d_matrix, epsilon = NULL) {
   # if epsilon is not provided, use the median heuristic
   if (is.null(epsilon)) {
     # median of the upper triangle to avoid the 0s on the diagonal
+    # the average data point will will score in the middle
     epsilon <- median(d_matrix_sq[upper.tri(d_matrix_sq)])
   }
 
@@ -13,7 +14,7 @@ density_estimation <- function(d_matrix, epsilon = NULL) {
   density_estimates <- rowSums(kernel_matrix)
 
   estimation <- list()
-  estimation$lens <- density_estimates / nrow(d_matrix) # normalise
+  estimation$values <- density_estimates / nrow(d_matrix) # normalise
   estimation$epsilon <- epsilon
 
   return(estimation)

@@ -1,10 +1,10 @@
-cluster_single_linkage <- function(data_subset, height_threshold = NULL) {
+cluster_single_linkage <- function(distances, height_threshold = NULL) {
   # handle edge cases where clustering isn't possible
-  if (nrow(data_subset) <= 1) {
-    return(rep(1, nrow(data_subset)))
+  if (nrow(distances) <= 1) {
+    return(rep(1, nrow(distances)))
   }
-  sub_dist <- dist(data_subset)
-  hc <- hclust(sub_dist, method = "single")
+  distances <- as.dist(distances)
+  hc <- hclust(distances, method = "single")
   
   # dynamic threshold
   if (is.null(height_threshold)) {
@@ -14,20 +14,20 @@ cluster_single_linkage <- function(data_subset, height_threshold = NULL) {
   return(cutree(hc, h = height_threshold))
 }
 
-cluster_hierarchical_ward <- function(data_subset, height_threshold = NULL) {
+cluster_hierarchical_ward <- function(distances, height_threshold = NULL) {
   # handle edge cases where clustering isn't possible
-  if (nrow(data_subset) <= 1) {
-    return(rep(1, nrow(data_subset)))
+  if (nrow(distances) <= 1) {
+    return(rep(1, nrow(distances)))
   }
-  sub_dist <- dist(data_subset)
+  distances <- as.dist(distances)
   # ward.D2 squares the distances (Ward's criterion)
-  hc <- hclust(sub_dist, method = "ward.D2")
+  hc <- hclust(distances, method = "ward.D2")
   
   # dynamic threshold
   if (is.null(height_threshold)) {
     # if the max tree height is near 0, treat the entire subset as 1 cluster
     if (max(hc$height) < 0.01) {
-      return(rep(1, nrow(data_subset)))
+      return(rep(1, nrow(distances)))
     }
     # cut at 70% of the maximum tree height
     height_threshold <- max(hc$height) * 0.70
@@ -35,9 +35,13 @@ cluster_hierarchical_ward <- function(data_subset, height_threshold = NULL) {
   return(cutree(hc, h = height_threshold))
 }
 
-cluster_gap_heuristic <- function(data_subset, k_bins = NULL) {
+cluster_gap_heuristic <- function(distances, k_bins = NULL) {
   # histogram gap heuristic from Singh et al. 2007
-  single_linkage_clustering <- hclust(dist(data_subset), method = "single")
+  if (nrow(distances) <= 1) {
+    return(rep(1, nrow(distances)))
+  }
+  distances <- as.dist(distances)
+  single_linkage_clustering <- hclust(distances, method = "single")
 
   # merge heights (edge lengths at each step)
   merge_heights <- single_linkage_clustering$height
