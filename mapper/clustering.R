@@ -1,4 +1,4 @@
-cluster_single_linkage <- function(distances, height_threshold = NULL) {
+cluster_single_linkage <- function(distances, cut_height = NULL) {
   # handle edge cases where clustering isn't possible
   if (nrow(distances) <= 1) {
     return(rep(1, nrow(distances)))
@@ -7,14 +7,14 @@ cluster_single_linkage <- function(distances, height_threshold = NULL) {
   hc <- hclust(distances, method = "single")
   
   # dynamic threshold
-  if (is.null(height_threshold)) {
+  if (is.null(cut_height)) {
     # Cut at 70% of the maximum dendrogram height
-    height_threshold <- max(hc$height) * 0.70
+    cut_height <- max(hc$height) * 0.70
   }
-  return(cutree(hc, h = height_threshold))
+  return(cutree(hc, h = cut_height))
 }
 
-cluster_hierarchical_ward <- function(distances, height_threshold = NULL) {
+cluster_hierarchical_ward <- function(distances, cut_height = NULL) {
   # handle edge cases where clustering isn't possible
   if (nrow(distances) <= 1) {
     return(rep(1, nrow(distances)))
@@ -24,15 +24,15 @@ cluster_hierarchical_ward <- function(distances, height_threshold = NULL) {
   hc <- hclust(distances, method = "ward.D2")
   
   # dynamic threshold
-  if (is.null(height_threshold)) {
+  if (is.null(cut_height)) {
     # if the max tree height is near 0, treat the entire subset as 1 cluster
     if (max(hc$height) < 0.01) {
       return(rep(1, nrow(distances)))
     }
     # cut at 70% of the maximum tree height
-    height_threshold <- max(hc$height) * 0.70
+    cut_height <- max(hc$height) * 0.70
   }
-  return(cutree(hc, h = height_threshold))
+  return(cutree(hc, h = cut_height))
 }
 
 cluster_gap_heuristic <- function(distances, k_bins = NULL) {

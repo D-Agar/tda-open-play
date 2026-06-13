@@ -53,33 +53,49 @@ create_mapper_graph <- function(mapper_obj, colourisation, original_data, groups
 }
 
 plot_mapper_graph <- function(
-  graph, colourisation, graph_layout = layout_with_kk, legend = TRUE, legend_title = "PCA Components"
+  graph,
+  colourisation,
+  graph_layout = layout_with_kk,
+  legend = TRUE,
+  legend_title = NULL,
+  legend_tick_num = 5
 ) {
   z_limits <- c(min(colourisation), max(colourisation))
   colour_palette_fn <- colorRampPalette(c("blue", "yellow", "red"))
   par(mar = c(1, 1, 1, 4))
   plot(graph, layout = graph_layout(graph))
   if (legend) {
-    image.plot(
-      legend.only = TRUE,
-      zlim = z_limits,
-      col = colour_palette_fn(100),
-      legend.width = 1.5,
+    legend <- setupLegend(
+      horizontal = FALSE,
       legend.shrink = 0.5,
+      legend.width = 1.0,
+      legend.mar = 4.1
+    )
+    ticks <- seq(z_limits[1], z_limits[2], length.out = legend_tick_num)
+    addLegend(
+      legend,
+      zlim=z_limits,
+      col=colour_palette_fn(100),
       legend.args = list(
         text = legend_title,
-        side = 3,
-        line = 1,
-        cex = 0.8
+        side = 2,
+        line = 0.5
+      ),
+      # axis.args to control the tick lines
+      axis.args = list(
+        at = ticks,
+        labels = round(ticks, 2)
       )
     )
   }
 }
 
-add_continuous_legend <- function(network_obj,
-                                  title = "Continuous Filter",
-                                  colours = c("blue", "yellow", "red"),
-                                  labels = c("Low", "High")) {
+add_continuous_legend <- function(
+  network_obj,
+  title = "Continuous Filter",
+  colours = c("blue", "yellow", "red"),
+  labels = c("Low", "High")
+) {
   # css gradient string
   gradient_string <- paste(colours, collapse = ", ")
   gradient_css <- sprintf("linear-gradient(to right, %s)", gradient_string)

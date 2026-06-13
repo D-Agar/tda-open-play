@@ -5,7 +5,7 @@ library(RColorBrewer)
 
 # source functionality
 mapper_files <- list.files(file.path("mapper"), full.names = TRUE)
-mapper_files <- mapper_files[!mapper_files %in% c("mapper/test.R")]
+mapper_files <- mapper_files[!mapper_files %in% c("mapper/test.R", "mapper/test.R.tmp.R")]
 for (file in mapper_files) {
   source(file)
 }
@@ -46,4 +46,11 @@ graph <- create_mapper_graph(
     cat_colour = brewer.pal(length(unique(diabetes$group)), "Set1")
   )
 )
-plot_mapper_graph(graph, colourisation = filter_values, legend_title = "KDE")
+plot_mapper_graph(
+  graph,
+  graph_layout = layout_with_kk,
+  colourisation = filter_values,
+  legend = TRUE,
+  legend_title = "KDE"
+)
+
