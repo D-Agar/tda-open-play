@@ -57,6 +57,39 @@ create_fixed_intervals <- function(filter_values, num_intervals, percent_overlap
   return(interval_grid)
 }
 
+create_equalised_intervals <- function(filter_values, num_intervals, percent_overlap, method = "rectangle") {
+  filter_values <- as.matrix(filter_values)
+  n_dims <- ncol(filter_values)
+
+  # parameter dimension matching
+  if (length(num_intervals) == 1) num_intervals <- rep(num_intervals, n_dims)
+  if (length(percent_overlap) == 1) percent_overlap <- rep(percent_overlap, n_dims)
+
+  # Loop through each dimension independently to find marginal percentiles
+  intervals <- lapply(seq_len(n_dims), function(dim) {
+    m <- num_intervals[dim]
+    overlap_frac <- percent_overlap[dim] / 100
+
+    # Get interval length and step size as percentiles for this specific dimension
+    interval_length <- 1 / ((m - 1) * (1 - overlap_frac) + 1)
+    step_size <- interval_length * (1 - overlap_frac)
+    
+    dim_intervals <- list()
+    for (i in seq_len(m)) {
+      # Percentile start/end for interval i
+      start <- (i - 1) * step_size
+      end <- start + interval_length
+
+      # Map percentiles strictly back to data points within column 'dim'
+      dim_intervals[[i]] <- quantile(filter_values[, dim], probs = c(start, end), na.rm = TRUE)
+    }
+    return(dim_intervals)
+  })
+  
+  # Construct the final hyperbox grid combinations
+  interval_grid <- create_interval_grid(intervals = intervals, method = method)
+  return(interval_grid)
+}
 # check if a coordinate lies in a hyperbox
 is_point_in_interval <- function(filter_values, interval) {
   in_interval <- sapply(seq_along(interval), function(dim) {
@@ -161,3 +194,56 @@ compute_mapper <- function(
     interval_ids = interval_ids
   ))
 }
+
+# mapper node data
+get_node_details <- function(mapper_obj, original_data, node_id) {
+  if (node_id > mapper_obj$num_vertices || node_id < 1) {
+    stop("Invalid node_id requested")
+  }
+
+  point_indices <- mapper_obj$points_in_vertex[[node_id]]
+
+  node_data <- original_data[point_indices, ]
+  return(node_data)
+}
+
+# summary statistics of the mapper nodes
+summarise_graph <- function(mapper_obj, original_data) {
+  original_data_size <- nrow(original_data)
+  numeric_cols <- colnames(original_data)[sapply(original_data, is.numeric)]
+  categoric_cols <- setdiff(colnames(original_data), numeric_cols)
+
+  metrics <- lapply(seq_along(mapper_obj$points_in_vertex), function(node) {
+    node_data <- get_node_details(mapper_obj, original_data, node)
+    node_size <- length(mapper_obj$points_in_vertex[[node]])
+    size_pct <- round((node_size / original_data_size) * 100, 4)
+
+    node_metrics <- data.frame(
+      size = node_size,
+      size_pct = size_pct
+    )
+    if (node_size > 0) {
+      
+      if (length(numeric_cols) > 0) {
+        means <- sapply(node_data[, numeric_cols, drop = FALSE], mean, na.rm = TRUE)
+        names(means) <- paste0("mean_", numeric_cols)
+
+        medians <- sapply(node_data[, numeric_cols, drop = FALSE], median, na.rm = TRUE)
+        names(medians) <- paste0("median_", numeric_cols)
+
+        numeric_values <- cbind(as.data.frame(t(means)), as.data.frame(t(medians)))
+        node_metrics <- cbind(node_metrics, numeric_values)
+      }
+      # if (length(categoric_cols) > 0) {
+      #   modes = sapply(node_data[, categoric_cols, drop = FALSE], find_mode)
+      #   names(modes) <- paste0("mode_", categoric_cols)
+      #   categoric_values <- as.data.frame(t(modes))
+      #   node_metrics <- cbind(node_metrics, categoric_values)
+      # }
+    }
+    return(node_metrics)
+  })
+
+  return(do.call(rbind, metrics))
+}
+

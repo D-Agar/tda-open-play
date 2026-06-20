@@ -1,21 +1,42 @@
 density_estimation <- function(d_matrix, epsilon = NULL) {
   d_matrix <- as.matrix(d_matrix)
+  n <- nrow(d_matrix)
+
+  # squared distances
   d_matrix_sq <- d_matrix^2
 
-  # if epsilon is not provided, use the median heuristic
+  # dimension-adjusted scale, from kde function
   if (is.null(epsilon)) {
-    # median of the upper triangle to avoid the 0s on the diagonal
-    # the average data point will will score in the middle
-    epsilon <- median(d_matrix_sq[upper.tri(d_matrix_sq)])
+    # Number of features/dimensions
+    d <- ncol(d_matrix)
+    med_dist <- median(d_matrix[upper.tri(d_matrix)])
+    
+    # Approximate a dimension-adjusted bandwidth, then square it for your formula
+    bandwidth <- med_dist * (4 / (d + 2))^(1 / (d + 4))
+    epsilon <- 2 * (bandwidth^2)
   }
 
+  # exponential kernel component (Gaussian)
   kernel_matrix <- exp(-d_matrix_sq / epsilon)
-  # maybe need to calculate the constant for correct integral
-  density_estimates <- rowSums(kernel_matrix)
+  
+  # sum over each point
+  sum_y <- rowSums(kernel_matrix)
+
+  # normalisation constant C_epsilon
+  c_eps <- 1 / n
 
   estimation <- list()
-  estimation$values <- density_estimates / nrow(d_matrix) # normalise
+  estimation$values <- c_eps * sum_y
   estimation$epsilon <- epsilon
 
   return(estimation)
+}
+
+calculate_eccentricity <- function(d_matrix, exponent = 2) {
+  # row-wise vector norms
+  row_norm <- (abs(d_matrix)^exponent)^(1/exponent)
+  norm_sums <- rowSums(row_norm)
+
+  # keep dimensions
+  return(matrix(norm_sums))
 }

@@ -5,17 +5,21 @@ library(htmltools)
 library(htmlwidgets)
 
 # construction
-create_mapper_graph <- function(mapper_obj, colourisation, original_data, groups = NULL) {
+create_mapper_graph <- function(
+  mapper_obj, colourisation, original_data, groups = NULL,
+  graph_layout = layout_with_kk, legend = TRUE,
+  legend_title = NULL, legend_tick_num = 5
+) {
   # create a mapper graph, with node sizes, colours, and the option for nodes to be pie charts
   g <- graph_from_adjacency_matrix(mapper_obj$adjacency, mode = "undirected")
   
   # node size is the cluster size
-  V(g)$size <- sapply(mapper_obj$nodes, length)
-  
+  node_counts <- sapply(mapper_obj$points_in_vertex, length)
+
   colourisation <- as.matrix(colourisation)
   # node colour is the lens value (by default)
   # Euclidean distance magnitude from the center across dimensions
-  mean_colours <- sapply(mapper_obj$nodes, function(indices) {
+  mean_colours <- sapply(mapper_obj$points_in_vertex, function(indices) {
     # column averages for this specific node block
     dim_means <- colMeans(colourisation[indices, , drop = FALSE])
     return(sqrt(sum(dim_means^2)))
@@ -49,21 +53,12 @@ create_mapper_graph <- function(mapper_obj, colourisation, original_data, groups
     V(g)$pie.color <- list(groups$cat_colour)
   }
 
-  return(g)
-}
-
-plot_mapper_graph <- function(
-  graph,
-  colourisation,
-  graph_layout = layout_with_kk,
-  legend = TRUE,
-  legend_title = NULL,
-  legend_tick_num = 5
-) {
   z_limits <- c(min(colourisation), max(colourisation))
-  colour_palette_fn <- colorRampPalette(c("blue", "yellow", "red"))
   par(mar = c(1, 1, 1, 4))
-  plot(graph, layout = graph_layout(graph))
+  size <- dev.size("px")
+  V(g)$size <- log(node_counts + 1) / mapper_obj$num_vertices
+
+  plot(g, layout = graph_layout(g))
   if (legend) {
     legend <- setupLegend(
       horizontal = FALSE,
@@ -88,6 +83,7 @@ plot_mapper_graph <- function(
       )
     )
   }
+  return(g)
 }
 
 add_continuous_legend <- function(

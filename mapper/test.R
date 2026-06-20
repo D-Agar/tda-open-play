@@ -1,23 +1,25 @@
 # General script testing the mapper functionality
+# This script creates a Mapper graph for the Reaven-Miller diabetes dataset (~1973)
+# It is taken from Singh et al. 2007 (the Mapper introductory paper)
 library(rrcov) # Reaven-Miller Diabetes dataset
 library(igraph)
 library(RColorBrewer)
+library(ks)
+source("utils.R")
 
 # source functionality
-mapper_files <- list.files(file.path("mapper"), full.names = TRUE)
-mapper_files <- mapper_files[!mapper_files %in% c("mapper/test.R", "mapper/test.R.tmp.R")]
-for (file in mapper_files) {
-  source(file)
-}
+sourceDir("mapper", exclude = "test.R")
 
 # data setup
 data(diabetes)
 raw_data <- diabetes[, 1:5]
-raw_scaled <- data.frame(scale(raw_data))
+# center = FALSE to keep spatial information
+raw_scaled <- data.frame(scale(raw_data[, 1:5], center = FALSE))
 
 d_matrix <- dist(raw_scaled, method = "euclidean")
 
-filter_values <- density_estimation(d_matrix, epsilon = NULL)$values
+density_est <- density_estimation(d_matrix, epsilon = NULL)
+filter_values <- density_est$values
 
 num_intervals <- 4
 percent_overlap <- 50
@@ -34,7 +36,7 @@ mapper <- compute_mapper(
   intervals = intervals,
   pruning = FALSE,
   clustering = cluster_gap_heuristic,
-  k_bins = 6
+  k_bins = 5
 )
 
 graph <- create_mapper_graph(
@@ -53,4 +55,3 @@ plot_mapper_graph(
   legend = TRUE,
   legend_title = "KDE"
 )
-
