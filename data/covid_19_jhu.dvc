@@ -1,0 +1,6 @@
+outs:
+- md5: 7ae01b3f93e98015e938d2cb4b1316d7.dir
+  size: 67822957
+  nfiles: 10
+  hash: md5
+  path: covid_19_jhu

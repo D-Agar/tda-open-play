@@ -1,0 +1,445 @@
+---
+title: "COVID-19 Mapper"
+format: html
+---
+
+This document attempts to recreate the work in the paper "Topological data analysis model for the spread of coronavirus" by Chen and volilc (2021).
+The aim of this paper is to understand and simplify the United States COVID-19 data cloud whilst preserving the underlying structure and features.
+
+Todo: summarise each individual component (bar chart of states/counties, cases), create annotated image of the components
+
+First I need to clean and preprocess the data in accordance to their method:
+* days = number of days since 22/1/20 (british format)
+* select longitude, lattitude, cummulative confirmed cases, days since
+* Create two subsets of the data: unfiltered, and filtered (no Los Angeles, Illinois or New York)
+  + Further two subsets for the temporal ranges to 19/6/20 and 24/7/20
+  + For now, I will just use the first boundary, as to simplify the document
+
+```{r}
+#| label: data-setup
+#| output: false
+
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(jsonlite)
+library(MapperAlgo)
+library(igraph)
+
+raw_data <- read.csv(here::here("data/covid_19_jhu/RAW_us_confirmed_cases.csv"))
+
+start_date <- as.Date('22/1/20', format = "%d/%m/%y")
+end_date1 <- as.Date('19/6/20', format = "%d/%m/%y")
+end_date2 <- as.Date('24/7/20', format = "%d/%m/%y")
+
+# create long date format
+# quick data formatting
+rename_cols <- c(
+    state = "Province_State",
+    county = "Admin2",
+    uid = "UID",
+    fips = "FIPS",
+    country_region = "Country_Region",
+    latitude = "Lat",
+    longitude = "Long_",
+    combined_key = "Combined_Key"
+)
+factor_cols <- c("state", "county", "iso2", "iso3", "country_region")
+long_data <- raw_data |>
+    pivot_longer(
+        cols = starts_with("X"),
+        names_to = "date",
+        values_to = "cases"
+    ) |>
+    mutate(
+        date = gsub("^X", "", date),
+        date = gsub("\\.", "/", date),
+        date = mdy(date),
+        days = as.integer(difftime(date, start_date, units = "days")),
+        index = row_number()
+    ) |>
+    filter(
+        date >= start_date
+    ) |>
+    rename(all_of(rename_cols)) |>
+    mutate(across(all_of(factor_cols), as.factor))
+
+# create subsets for different ranges
+# subset2 <- long_data |>
+#     filter(date <= end_date2)
+
+geographically_filter_data <- function(data) {
+    filtered <- data |>
+        filter_out(when_any(
+            county %in% c("Los Angeles"),
+            state %in% c("Illinois", "New York")
+        ))
+    return(filtered)
+}
+
+subset1 <- long_data |>
+    filter(date <= end_date1)
+
+# scale so the sum of the squared column values is 1 (L2 norm)
+# used when direction is more important than magnitude
+# outliers kept as this complements DBSCAN
+filter_cols <- c("latitude", "longitude", "cases", "days")
+subset1 <- subset1 |>
+    mutate(across(
+        all_of(filter_cols),
+        function(col) {
+            norm_val <- sqrt(sum(col^2, na.rm = TRUE))
+            if (norm_val == 0) return(col) # stop division error
+            return(col / norm_val)
+        },
+        .names = "{.col}_norm"
+    ))
+
+# keep the unfiltered norm values, just removing the known outliers
+filt_subset1 <- geographically_filter_data(subset1)
+```
+
+# Mapper Setup
+
+Now we can try the Mapper algorithm used:
+* No filter function per se, just the identity mapping of the data
+* Euclidean distance metric
+* 10 intervals, 8% overlap
+* DBSCAN clustering
+
+There filter function is is just the identity map (a 4-dimensional function that is just the data points).
+With such few dimensions, and the fact they are exploring for statistical findings, there was no need to project the data.
+An 8% overlap was determined as it "empirically" appears to give the most informative Mapper graphs.
+DBSCAN was simply chosen
+
+The colours for the graphs are based on the data's order, which is by the geographical information, so nearby states are coloured similary.
+
+```{r}
+#| label: mapper setup
+
+base_dir <- file.path("examples", "covid_mapper_files")
+subset1_mapper_file <- "subset1_mapper.json"
+filt_subset1_mapper_file <- "filt_subset1_mapper.json"
+subset1_mapper_data <- subset1 |> select(ends_with("_norm"))
+filt_subset1_mapper_data <- filt_subset1 |> select(ends_with("_norm"))
+```
+
+```{r}
+#| label: create mappers
+
+subset1_mapper_time <- system.time({
+    subset1_mapper <- MapperAlgo(
+        subset1_mapper_data,
+        filter_values = subset1_mapper_data,
+        percent_overlap = 8,
+        intervals = 10,
+        methods = "dbscan",
+        method_params = list(eps = 0.5, minPts = 3), # same config as KeplerMapper
+        num_cores = 18 # quicker performance
+    )
+})
+message("Unfiltered subset1 Mapper time:", subset1_mapper_time)
+
+export_data <- list(
+  adjacency = subset1_mapper$adjacency,
+  num_vertices = subset1_mapper$num_vertices,
+  level_of_vertex = subset1_mapper$level_of_vertex,
+  points_in_vertex = subset1_mapper$points_in_vertex,
+  original_data = subset1_mapper_data
+)
+write(toJSON(export_data, auto_unbox = TRUE), file.path(base_dir, subset1_mapper_file))
+message("Saved mapper as JSON to ", file.path(base_dir, subset1_mapper_file))
+
+filt_subset1_mapper_time <- system.time({
+    filt_subset1_mapper <- MapperAlgo(
+        filt_subset1_mapper_data,
+        filter_values = filt_subset1_mapper_data,
+        percent_overlap = 8,
+        intervals = 10,
+        methods = "dbscan",
+        method_params = list(eps = 0.5, minPts = 3), # same config as KeplerMapper
+        num_cores = 18 # quicker performance
+    )
+})
+message("Filtered Mapper time:", filt_subset1_mapper_time)
+
+export_data <- list(
+  adjacency = filt_subset1_mapper$adjacency,
+  num_vertices = filt_subset1_mapper$num_vertices,
+  level_of_vertex = filt_subset1_mapper$level_of_vertex,
+  points_in_vertex = filt_subset1_mapper$points_in_vertex,
+  original_data = filt_subset1_mapper_data
+)
+write(toJSON(export_data, auto_unbox = TRUE), file.path(base_dir, filt_subset1_mapper_file))
+message("Saved mapper as JSON to ", file.path(base_dir, filt_subset1_mapper_file))
+```
+
+```{r}
+#| label: load mappers
+subset1_mapper <- fromJSON(file.path(base_dir, subset1_mapper_file))
+filt_subset1_mapper <- fromJSON(file.path(base_dir, filt_subset1_mapper_file))
+```
+
+# Mapper Exploration
+```{r}
+#| label: mapper_visualisation
+
+subset1_plot <- MapperPlotter(
+    subset1_mapper,
+    original_data = subset1_mapper_data,
+    label = subset1$latitude,
+    avg = TRUE,
+    use_embedding = FALSE
+)
+subset1_plot
+
+subset1_graph <- graph_from_adjacency_matrix(subset1_mapper$adjacency, mode = "undirected")
+V(subset1_graph)$
+
+filt_subset1_plot <- MapperPlotter(
+    filt_subset1_mapper,
+    original_data = filt_subset1_mapper_data,
+    label = filt_subset1$latitude,
+    avg = TRUE,
+    use_embedding = FALSE
+)
+filt_subset1_plot
+```
+
+
+```{r}
+#| label: node data
+source("utils.R")
+sourceDir("mapper", exclude = "test.R")
+
+subset1_mapper_stats <- summarise_graph(subset1_mapper, subset1_mapper_data)
+print(subset1_mapper_stats)
+
+original_nrow <- nrow(subset1)
+
+subset1_nodes <- get_node_mapping(subset1_mapper, subset1)
+subset1 <- subset1 |>
+    # make a new row for every node assignment
+    left_join(subset1_nodes, by = "index") |>
+    unnest_longer(node)
+
+new_nrow <- nrow(subset1)
+diff <- new_nrow - original_nrow
+if (diff > 0) {
+    message("Subset1 increased by ", diff, " rows")
+} else {
+    message("No dimensional change for subset 1")
+}
+
+original_nrow <- nrow(filt_subset1)
+
+filt_subset1_nodes <- get_node_mapping(filt_subset1_mapper, filt_subset1)
+filt_subset1 <- filt_subset1 |>
+    left_join(filt_subset1_nodes, by = "index") |>
+    unnest_longer(node)
+
+new_nrow <- nrow(filt_subset1)
+diff <- new_nrow - original_nrow
+if (diff > 0) {
+    message("Filtered subset1 increased by ", diff, " rows")
+} else {
+    message("No dimensional change for filtered subset1")
+}
+```
+
+I will explore the clusters.
+
+```{r}
+#| label: get_clusters
+
+subset1_clusters <- find_isolated_components(subset1_mapper, subset1)
+# check to see if there are nodes in multiple components (sanity check)
+subset1_clusters |>
+   group_by(node) |>
+   summarise(n_comps = n()) |>
+   filter(n_comps > 1)
+
+subset1 <- subset1 |>
+    left_join(subset1_clusters, by = "node")
+
+filt_subset1_clusters <- find_isolated_components(filt_subset1_mapper, filt_subset1)
+filt_subset1_clusters |>
+   group_by(node) |>
+   summarise(n_comps = n()) |>
+   filter(n_comps > 1)
+
+filt_subset1 <- filt_subset1 |>
+    left_join(filt_subset1_clusters, by = "node")
+```
+
+### Component 1
+
+Through investigation, component 1 is the American Samoa, located near the islands Fiji and Samoa.
+It consists of 10 nodes, each with 16 rows of data.
+This component has 0 cases of COVID-19, which could be a systematic error (no measurements taken).
+```{r}
+#| label: unfiltered cluster 1
+
+subset1_comp1 <- subset1 |>
+    filter(component == 1)
+summary(subset1_comp1)
+table(subset1_comp1$state, useNA = "no")
+table(subset1_comp1$county)
+```
+
+### Component 2
+
+Component 2 is Hawaii.
+```{r}
+#| label: unfiltered cluster 2
+subset1_comp2 <- subset1 |>
+    filter(component == 2)
+
+summary(subset1_comp2)
+table(subset1_comp2$state) # only Hawaii
+message("Time range: ", min(subset1_comp2$date), " to ", max(subset1_comp2$date))
+```
+
+### Component 3
+
+Component 3 is more western Alaska, consisting of 4160 data points and 40 nodes, with consistent large peaks and small ones also.
+```{r}
+#| label: unfiltered cluster 3
+
+subset1_comp3 <- subset1 |>
+    filter(component == 3)
+
+summary(subset1_comp3)
+table(subset1_comp3$node)
+length(unique(subset1_comp3$node))
+ggplot(subset1_comp3, aes(node)) + geom_histogram()
+```
+
+### Component 4
+Component 4 is the main trunk of data, which I will now explore.
+
+```{r}
+#| label: main_trunk
+
+unfilt_trunk_data <- unfilt_mapper_raw |>
+    filter(component == 4)
+
+unfilt_trunk_data |>
+    group_by(state) |>
+    summarise(n = n()) |>
+    arrange(desc(n))
+```
+
+### Component 5
+
+Component 5 is Eastern Alaska
+```{r}
+#| label: unfiltered cluster 5
+subset1_comp5 <- subset1 |> filter(component == 5)
+
+summary(subset1_comp5)
+table(subset1_comp5$node)
+```
+
+### Component 6
+
+This component consists of all of Puerto Rico
+```{r}
+#| label: unfiltered cluster 6
+
+subset1_comp6 <- subset1 |> filter(component == 6)
+summary(subset1_comp6)
+table(subset1_comp6$node)
+```
+
+### Component 7
+
+
+```{r}
+#| label: unfiltered cluster 7
+
+subset1_comp7 <- subset1 |> filter(component == 7)
+summary(subset1_comp7)
+table(subset1_comp7$node)
+```
+
+### Component 8
+
+Component 8 is Guam and the Northern Mariana Islands in the North-Western Pacific
+```{r}
+#| label: unfiltered cluster 8
+
+subset1_comp8 <- subset1 |> filter(component == 8)
+summary(subset1_comp8)
+table(subset1_comp8$node)
+```
+
+### Component 9
+
+Component 9 is just Cook and Illinois from 04/05/2020 to 15/05/2020, just 11 days.
+This is highlighted as its own component as it consists of a large amount of cases, more than 250 times the data's mean 
+```{r}
+#| label: unfiltered cluster 9
+
+subset1_comp9 <- subset1 |> filter(component == 9)
+summary(subset1_comp9)
+table(subset1_comp9$node)
+```
+
+### Component 10
+
+This is more Cook, Illinois in the 17,000 range of cases from 16/05/2020 to 19/16/2020
+```{r}
+#| label: unfiltered cluster 10
+
+subset1_comp10 <- subset1 |> filter(component == 10)
+summary(subset1_comp10)
+table(subset1_comp10$node)
+```
+
+### Component 11
+
+This is Harris, Texas, from 09/06/2020 to 19/06/2020
+```{r}
+#| label: unfiltered cluster 11
+
+subset1_comp11 <- subset1 |> filter(component == 11)
+summary(subset1_comp11)
+table(subset1_comp11$node)
+```
+
+### Component 12
+
+This is a section of Los Angeles, California, from 05/06/2020 to 17/06/2020 recording between 61000 and 78000 cases in this component.
+```{r}
+#| label: unfiltered cluster 12
+
+subset1_comp12 <- subset1 |> filter(component == 12)
+summary(subset1_comp12)
+table(subset1_comp12$node)
+```
+
+### Component 13
+
+This is the final LA section of nearly 80,000 cases. It is a single node of 2 data points.
+```{r}
+#| label: unfiltered cluster 13
+
+subset1_comp13 <- subset1 |> filter(component == 13)
+summary(subset1_comp13)
+table(subset1_comp13$node)
+```
+
+# Smaller Experimentation
+
+I will try explore a smaller subset of data between 22/1/2020 to 5/4/2020 (the median)
+
+
+```{r}
+small_data <- subset1 |>
+    filter(date < as.Date("5/4/20", format = "%d/%m/%y"))
+
+small_scaled <- small_data |>
+    mutate(across(all_of(filter_cols), scale(.data, center = FALSE)), .names = "{.col}_zscale")
+```
