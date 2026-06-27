@@ -9,11 +9,11 @@ get_node_mapping <- function(mapper_obj, original_data) {
       return(actual_ids[mapper_indices])
     })
   ) |>
-  # flatten for multiple rows of indices
-  unnest(index) |>
-  # nodes become lists
-  group_by(index) |>
-  summarise(node = list(as.numeric(node)), .groups = "drop")
+    # flatten for multiple rows of indices
+    unnest(index) |>
+    # nodes become lists
+    group_by(index) |>
+    summarise(node = list(as.numeric(node)), .groups = "drop")
 }
 
 find_isolated_components <- function(mapper_obj, original_data) {
@@ -31,7 +31,8 @@ find_isolated_components <- function(mapper_obj, original_data) {
     return(NULL)
   }
 
-  message("Found ", length(isolated_component_ids),
+  message(
+    "Found ", length(isolated_component_ids),
     " isolated component(s) detached from the main trunk."
   )
 
@@ -43,7 +44,3 @@ find_isolated_components <- function(mapper_obj, original_data) {
   return(node_to_component)
 }
 
-# get the flares of the mapper graph, 
-get_flares <- function(mapper_obj, original_data, attr, id) {
-
-}

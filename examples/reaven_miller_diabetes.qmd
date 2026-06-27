@@ -1,6 +1,6 @@
 ---
-title: "Reaven-Miller Diabetes Mapper Experimentation"
-output: html_notebook
+title: "Untitled"
+format: html
 ---
 
 This notebook experiments with the Mapper algorithm on the Reaven-Miller diabetes dataset.
@@ -18,18 +18,15 @@ library(igraph)
 library(visNetwork)
 library(htmlwidgets)
 library(RColorBrewer)
+source(here::here("utils.R"))
 
-# helper functions for mapper construction
-mapper_files <- list.files(file.path("mapper"), full.names = TRUE)
-for (file in mapper_files) {
-  source(file)
-}
+sourceDir(here::here("mapper"), exclude = "test.R")
 ```
 
 ```{r data_init}
 data(diabetes)
 raw_data <- diabetes[, 1:5]
-raw_scaled <- data.frame(scale(raw_data))
+raw_scaled <- data.frame(scale(raw_data, center = FALSE))
 groups <- diabetes$group
 ```
 
@@ -47,12 +44,38 @@ After multiple adjustments to the epsilon of the density estimations, the $k$ bi
 In the following visualisation, the colour represents varying densities in the data (low=blue, high=red).
 
 ## Low-resolution Mapper
+```{r low_res_MapperAlgo}
+library(MapperAlgo)
+l2_dist <- as.matrix(dist(raw_scaled, method = "euclidean"))
+density_est <- density_estimation(l2_dist)
+densities <- density_est$values
+
+low_res_mapper <- MapperAlgo(
+  original_data = raw_data,
+  filter_values = densities,
+  percent_overlap = 50,
+  methods = "hierarchical",
+  method_params = list(num_bins_when_clustering = 4, method = "single"),
+  cover_type = "stride",
+  intervals = 3
+)
+
+MapperPlotter(
+  low_res_mapper,
+  original_data = raw_data,
+  label = densities,
+  avg = TRUE,
+  use_embedding = FALSE
+)
+```
+
+
 ```{r low_res, fig.width=15, fig.height=6}
 # low-resolution mapper from Singh et al. 2007
 # euclidean distance matrix
 d_matrix <- as.matrix(dist(raw_scaled, method = "euclidean"))
 density_est <- density_estimation(d_matrix)
-density_lens <- density_est$lens
+density_lens <- density_est$values
 cat("Density epsilon: ", density_est$epsilon)
 
 pct_overlap <- 50
