@@ -1,19 +1,19 @@
-get_node_mapping <- function(mapper_obj) {
-  do.call(
-    rbind,
-    sapply(
-        seq_along(mapper_obj$points_in_vertex), function(vertex) {
-            points <- mapper_obj$points_in_vertex[[vertex]]
-            node_rep <- replicate(length(points), vertex)
-            df <- data.frame(
-                node = node_rep,
-                index = points
-            )
-            return(df)
-        },
-        simplify = FALSE
-    )
-  )
+library(tidyverse)
+library(igraph)
+
+get_node_mapping <- function(mapper_obj, original_data) {
+  actual_ids <- original_data$index
+  tibble(
+    node = seq_along(mapper_obj$points_in_vertex),
+    index = purrr:::map(mapper_obj$points_in_vertex, function(mapper_indices) {
+      return(actual_ids[mapper_indices])
+    })
+  ) |>
+  # flatten for multiple rows of indices
+  unnest(index) |>
+  # nodes become lists
+  group_by(index) |>
+  summarise(node = list(as.numeric(node)), .groups = "drop")
 }
 
 find_isolated_components <- function(mapper_obj, original_data) {
@@ -41,4 +41,9 @@ find_isolated_components <- function(mapper_obj, original_data) {
     component = graph_components$membership
   )
   return(node_to_component)
+}
+
+# get the flares of the mapper graph, 
+get_flares <- function(mapper_obj, original_data, attr, id) {
+
 }
