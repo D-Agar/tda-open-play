@@ -1,0 +1,709 @@
+---
+title: "Open Play: Data Understanding"
+author: "Daniel Agar"
+format: html
+abstract: "This document contains the initial exploration of the Open Play dataset, which has already been cleaned"
+---
+
+This document explores the clean version of the data set Open Play.
+This is to help me get a better understanding of the data I will be working with for my MSc dissertation.
+The cleaning process consisted of the following:
+- Steam:
+  -Removed idle games or non games (SteamVR, soundpad, etc.),
+  - Added approximate session times
+  - Scaled sessions over an hour
+  - Boolean indicator for new sessions
+  - Added number of hours sessions lasted
+  - Calculated metrics for each session/game id
+  - Created quality metrics (separate file containing information about the scaled instances)
+- Xbox:
+  - Merge adjacent sessions that are within a threshold (60 seconds)
+  - Remove non-game sessions (shopping/videos)
+  - Remove suspiciously long sessions (more than 6 hours)
+  - Merges adjacent sessions by splitting into lots of atomic sessions and merging
+- Nintendo:
+  - Filter duplicates
+  - Merge adjacent sessions with a minute tolerance
+- Android: simple renaming
+- iOS: simple renaming
+- Excludes entries where total gaming for a day is more than 16 hours
+- intake:
+  - Self-reported hours > 50, NA
+  - Remove duplicates of linked_platforms
+- daily:
+  - Remove daily duplicates of survey
+  - Recode erroneous wave codings by their start date
+  - Ignore "false starts" of game data (outside date range)
+- bikweekly:
+  - Remove daily duplicates of survey
+  - Recode erroneous wave codings by their start date
+  - Ignore "false starts" of game data (outside date range)
+- timeuse: assign quality flags to diaries
+  - No mention of sleep or personal care
+  - No sleep
+  - More than 90 minutes unacounted for
+  - Less than 5 activites logged during a day
+- simon:
+  - Only include non-pilot-study participants (weren't in initial pre-trial) who qualified at intake
+
+```{r} 
+#| label: libraries
+#| include: false
+#| code-summary: "Show code (Load required R packages)"
+library(tidyverse)
+library(data.table)
+library(dtplyr)
+library(naniar)
+library(gtsummary)
+library(GGally)
+library(VIM)
+
+theme_set(theme_minimal())
+source("examples/open-play/helpers.R")
+```
+
+I will fetch the cleaned datasets:
+```{r}
+#| label: data setup
+#| include: false
+android <- read_csv("data/open-play/clean/android.csv.gz")
+metadata <- read_csv("data/open-play/clean/game_metadata.csv.gz")
+ios <- read_csv("data/open-play/clean/ios.csv.gz")
+nintendo <- read_csv("data/open-play/clean/nintendo.csv.gz")
+simon <- read_csv("data/open-play/clean/simon.csv.gz")
+steam <- read_csv("data/open-play/clean/steam.csv.gz")
+steam_visibility <- read_csv("data/open-play/raw/telemetry_steam_account_linking_raw.csv.gz")
+biweekly <- read_csv("data/open-play/clean/biweekly.csv.gz")
+daily <- read_csv("data/open-play/clean/daily.csv.gz")
+intake <- read_csv("data/open-play/clean/intake.csv.gz")
+time_use <- read_csv("data/open-play/clean/timeuse.csv.gz") |>
+  filter(quality_flag == "Good quality")
+xbox <- read_csv("data/open-play/clean/xbox.csv.gz")
+
+xbox_raw <- read_csv("data/open-play/raw/telemetry_xbox_raw.csv.gz")
+nintendo_raw <- read_csv("data/open-play/raw/telemetry_nintendo_raw.csv.gz")
+daily_raw <- read_csv("data/open-play/raw/survey_daily_raw.csv.gz")
+biweekly_raw <- read_csv("data/open-play/raw/survey_biweekly_raw.csv.gz")
+```
+
+```{r}
+#| label: data cleaning
+# clean most likely to use columns
+intake <- intake |>
+  mutate(
+    gender_clean = case_when(
+      gender %in% c("Man", "Male", "man") ~ "Male",
+      gender %in% c("Woman", "Femal", "woman") ~ "Woman",
+      gender == "Prefer not to say" ~ NA_character_,
+      is.na(gender) ~ NA_character_,
+      TRUE ~ "Non-binary"
+    ),
+    ethnicity_clean = case_when(
+      ethnicity %in% c("White alone", "White") ~ "White",
+      ethnicity %in% c(
+        "Black",
+        "Black, African, Caribbean or Black British",
+        "Black or African American alone"
+      ) ~ "Black",
+      ethnicity %in% c(
+        "Asian",
+        "Asian alone",
+        "Asian or Asian British"
+      ) ~ "Asian",
+      ethnicity %in% c(
+        "Mixed",
+        "Mixed or multiple ethnic groups",
+        "Two or More Races"
+      ) ~ "Multiple",
+      ethnicity == "American Indian and Alaska Native alone" ~ "American Indian and Alaska Native",
+      ethnicity == "Native Hawaiian and Other Pacific Islander alone" ~ "Native Hawaiian and Other Pacific Islander",
+      ethnicity == "Prefer not to say" ~ NA_character_,
+      is.na(ethnicity) ~ NA_character_,
+      TRUE ~ "Other"
+    ),
+    political_party_clean = case_when(
+      # US Schema Matches
+      political_party == "Democratic Party" ~ "Democratic Party",
+      political_party == "Republican Party" ~ "Republican Party",
+      political_party == "Independent" ~ "Independent",
+ 
+      # UK Schema Matches
+      political_party == "Labour Party / Co-operative Party" ~ "Labour Party / Co-operative Party",
+      political_party == "Conservative and Unionist Party" ~ "Conservative and Unionist Party",
+      political_party == "Liberal Democrats" ~ "Liberal Democrats",
+      political_party == "Scottish National Party (SNP)" ~ "Scottish National Party (SNP)",
+      political_party == "Sinn Féin" ~ "Sinn Féin",
+      political_party == "Reform UK" ~ "Reform UK",
+      political_party == "Democratic Unionist Party (DUP)" ~ "Democratic Unionist Party (DUP)",
+      political_party == "Green Party of England and Wales" ~ "Green Party of England and Wales",
+      political_party == "Plaid Cymru" ~ "Plaid Cymru",
+      political_party == "No affiliation / Independent" ~ "No affiliation / Independent",
+ 
+      political_party == "Prefer not to say" ~ NA_character_,
+      is.na(political_party) ~ NA_character_,
+
+      # "Anarcho communist", "green", "All bad"
+      TRUE ~ "Other"
+    ),
+    marital_status_clean = case_when(
+      marital_status == "Single, never married" ~ "Single, never married",
+      marital_status == "Married" ~ "Married",
+      marital_status == "In a domestic partnership or civil union" ~ "In a domestic partnership or civil union",
+      marital_status == "Separated" ~ "Separated",
+      marital_status == "Divorced" ~ "Divorced",
+      marital_status == "Widowed" ~ "Widowed",
+      marital_status == "Prefer not to say" ~ NA_character_,
+      is.na(marital_status) ~ NA_character_,
+      TRUE ~ "Other"
+    ),
+    employment_clean = case_when(
+      employment == "Working full-time" ~ "Working full-time",
+      employment == "Working part-time" ~ "Working part-time",
+      employment == "Not currently employed" ~ "Not currently employed",
+      employment == "A homemaker or stay-at-home parent" ~ "A homemaker or stay-at-home parent",
+      employment == "Student" ~ "Student",
+      employment == "Retired" ~ "Retired",
+      is.na(employment) ~ NA_character_,
+      TRUE ~ "Other"
+    ),
+    edu_level_clean = str_trim(edu_level),
+    edu_level_clean = case_when(
+      edu_level_clean %in% c(
+        "Less than a high school diploma or equivalent",
+        "No formal qualifications",
+        "Completed Primary School",
+        "Completed Secondary School"
+      ) | str_detect(edu_level_clean, "^One to four GCSE passes") ~
+        "Less than a high school diploma or equivalent",
+      edu_level_clean %in% c(
+        "High school graduate or equivalent",
+        "Completed Secondary School",
+        "Apprenticeships",
+        "Vocational or Similar"
+      ) | str_detect(edu_level_clean, "^Five or more GCSE passes") ~
+        "High school graduate or equivalent",
+      edu_level_clean %in% c(
+        "Some college but no degree",
+        "Some University but no degree",
+        "Two or more A Levels or equivalent qualifications"
+      ) ~ "Some college but no degree",
+      edu_level_clean == "Associate degree" ~ "Associate degree",
+      edu_level_clean %in% c(
+        "Bachelor's degree",
+        "University Bachelors Degree"
+      ) ~ "Bachelor's degree",
+      str_detect(edu_level_clean, "^Higher National Certificate") |
+      edu_level_clean == "Master's degree, professional degree, or doctoral degree" ~
+        "Master's degree, professional degree, or doctoral degree",
+      edu_level_clean == "Prefer not to say" ~ NA_character_,
+      is.na(edu_level_clean) ~ NA_character_,
+      TRUE ~ "Other"
+    ),
+    # Neurodiverse flags
+    is_neurotypical = neuro_identify == "No" | is.na(neuro_identify),
+    is_adhd = !is.na(neuro_iden_adhd) | !is.na(neuro_diag_adhd),
+    is_dyscalculia = !is.na(neuro_iden_dyscalculia) | !is.na(neuro_diag_dyscalculia),
+    is_dyspraxia = !is.na(neuro_iden_dyspraxia) | !is.na(neuro_diag_dyspraxia),
+    is_ocd = !is.na(neuro_iden_ocd) | !is.na(neuro_diag_ocd),
+    is_prefer_not_say = !is.na(neuro_iden_prefer_not_say) | !is.na(neuro_diag_prefer_not_say),
+    is_specific_ld = !is.na(neuro_iden_specific_ld) | !is.na(neuro_diag_specific_ld),
+    is_neuro_diagnosed = !is.na(neuro_diagnosed),
+    is_asd = !is.na(neuro_iden_asd) | !is.na(neuro_diag_asd),
+    is_dyslexia = !is.na(neuro_iden_dyslexia) | !is.na(neuro_diag_dyslexia),
+    is_nvld = !is.na(neuro_iden_nvld) | !is.na(neuro_diag_nvld),
+    is_other = !is.na(neuro_iden_other) | !is.na(neuro_diag_other),
+    is_spd = !is.na(neuro_iden_spd) | !is.na(neuro_diag_spd),
+    is_tourette = !is.na(neuro_iden_tourette) | !is.na(neuro_diag_tourette),
+    # fix datetimes
+    enrollment_datetime = as_datetime(date, tz = "UTC"),
+    study_end_datetime = enrollment_datetime + days(84)
+  )
+
+steam_visibility <- steam_visibility |>
+  filter(platform == "steam") |>
+  mutate(
+    timestamp = as_datetime(timestamp, tz = "UTC"),
+    is_public = event == "steamDataPublic"
+  ) |>
+  select(pid, timestamp, event, is_public)
+
+# import raw data for calculating how many rows were excluded
+xbox_valid_sessions <- xbox_raw |>
+  merge_adjacent_sessions(tol_sec = 60) |>
+  # filter non-foreground games
+  filter(
+    duration >= 1,
+    pid %in% intake$pid,
+    title_placement == "Full", # in foreground
+    !genres %in% c("Shopping", "Video", "Entertainment", "Utilities & tools"),
+    tolower(title_id) != "e1924c10-9c91-4652-81b9-8ca0670e77a7" # home screen
+  )
+
+nintendo_valid_sessions <- nintendo_raw |>
+  distinct() |>
+  filter(
+    pid %in% intake$pid,
+    duration >= 1
+  ) |>
+  merge_adjacent_sessions(tol_sec = 60)
+```
+
+Now I shall select the qualified participants, as I know I will have more data to analyse.
+These participants are known to have completed at least one (biweekly) survey.
+
+```{r}
+#| label: aggregate-session-hourly-daily
+# merge with the local time zone offsets from intake
+# Note: We keep country and local_timezone for DST-aware conversion
+tz_map <- intake |>
+  mutate(
+    pid,
+    country,
+    local_timezone,
+    .keep = "none"
+  ) |>
+  distinct(pid, .keep_all = TRUE)
+
+# aggregate data at each level of granularity (session, hourly, daily)
+# --- 1) SESSION-LEVEL (Nintendo + Xbox) ------------------------------------
+session_telemetry <- bind_rows(
+  xbox |> mutate(platform = "Xbox"),
+  nintendo |> mutate(platform = "Nintendo")
+) |>
+  left_join(tz_map, by = "pid") |>
+  filter(!is.na(local_timezone)) |>
+  mutate(
+    # Calculate DST-aware offset for each timestamp
+    offset_start = get_dst_offset(session_start, country, local_timezone),
+    offset_end = get_dst_offset(session_end, country, local_timezone),
+    # Add offset to get local time values (keeping UTC label for compatibility)
+    start_local = session_start + offset_start,
+    end_local = session_end + offset_end,
+    duration_min = as.numeric(difftime(
+      session_end,
+      session_start,
+      units = "mins"
+    ))
+  ) |>
+  filter(
+    !is.na(session_start),
+    !is.na(session_end),
+    session_end > session_start,
+    duration_min >= 1
+  )
+
+# --- 2) HOURLY (Nintendo + Xbox expanded) ----------------------------------
+# expand sessions into local-hour bins, compute overlap minutes, and add UTC hour
+hourly_from_sessions <- session_telemetry |>
+  filter(!is.na(start_local), !is.na(end_local)) |>
+  mutate(
+    h0_local = floor_date(start_local, "hour"),
+    h1_local = floor_date(end_local - seconds(1), "hour"),
+    n_hours = as.integer(difftime(h1_local, h0_local, units = "hours")) + 1
+  ) |>
+  filter(!is.na(n_hours), n_hours > 0) |>
+  tidyr::uncount(n_hours, .remove = FALSE, .id = "k") |>
+  mutate(
+    hour_start_local = h0_local + hours(k - 1),
+    minutes = pmax(
+      0,
+      as.numeric(difftime(
+        pmin(end_local, hour_start_local + hours(1)),
+        pmax(start_local, hour_start_local),
+        units = "mins"
+      ))
+    ),
+    # Convert back to UTC (this preserves the instant, just changes label)
+    hour_start_utc = with_tz(hour_start_local, tzone = "UTC")
+  ) |>
+  select(pid, platform, title_id, hour_start_local, hour_start_utc, minutes) |>
+  group_by(pid, platform, title_id, hour_start_local, hour_start_utc) |>
+  summarise(minutes = sum(minutes, na.rm = TRUE), .groups = "drop")
+
+hourly_from_steam <- steam |>
+  mutate(
+    datetime_hour_start = ymd_hms(
+      paste0(date, " ", sprintf("%02d", hour), ":00:00"),
+      tz = "UTC"
+    )
+  ) |>
+  select(pid, title_id, datetime_hour_start, minutes) |>
+  left_join(tz_map, by = "pid") |>
+  filter(!is.na(local_timezone)) |>
+  mutate(
+    platform = "Steam",
+    hour_start_utc = datetime_hour_start,
+    offset = get_dst_offset(datetime_hour_start, country, local_timezone),
+    # Note: These are local time values with UTC labels due to R's POSIXct limitation
+    hour_start_local = datetime_hour_start + offset
+  ) |>
+  select(pid, platform, title_id, hour_start_local, hour_start_utc, minutes) |>
+  group_by(pid, platform, title_id, hour_start_local, hour_start_utc) |>
+  summarise(minutes = sum(minutes, na.rm = TRUE), .groups = "drop")
+
+hourly_telemetry <- bind_rows(hourly_from_sessions, hourly_from_steam)
+
+# --- 3) DAILY (Nintendo + Xbox + Steam; collapse hourly to days) -----------
+daily_telemetry <- hourly_telemetry |>
+  mutate(
+    day_local = as.Date(hour_start_local),
+  ) |>
+  group_by(pid, platform, day_local) |>
+  summarise(minutes = sum(minutes, na.rm = TRUE), .groups = "drop") |>
+  bind_rows(ios) |>
+  bind_rows(android)
+
+# --- 4) weekly
+weekly_all <- daily_telemetry |>
+  mutate(
+    week = floor_date(day_local, "week")
+  ) |>
+  group_by(pid, platform, week) |>
+  summarise(minutes = sum(minutes, na.rm = TRUE), .groups = "drop")
+
+telemetry_spans <- daily_telemetry |>
+  group_by(pid, platform) |>
+  summarise(
+    telemetry_start = min(day_local, na.rm = TRUE),
+    telemetry_end = max(day_local, na.rm = TRUE) + hours(1), # end of last hour bin
+    week = floor_date(telemetry_end, "week"),
+    n_weeks = as.integer(difftime(
+      telemetry_end,
+      telemetry_start,
+      units = "weeks"
+    )) +
+      1,
+    .groups = "drop"
+  )
+```
+
+```{r}
+#| label: game-summary-stats
+
+# participants
+n_baseline <- nrow(intake[intake$qualified, ])
+# participants in surveys
+n_participants <- sum(unique(c(daily$pid, biweekly$pid)) %in% intake$pid)
+n_participants_biweekly <- sum(unique(c(biweekly$pid)) %in% intake$pid)
+n_participants_daily <- sum(unique(c(daily$pid)) %in% intake$pid)
+
+participant_age <- (function(x) {
+  sprintf(
+    "%s years old (10th percentile: %s, 90th percentile: %s)",
+    print_num(median(x), .1),
+    print_num(quantile(x, 0.10), .1),
+    print_num(quantile(x, 0.90), .1)
+  )
+})(na.omit(intake$age[intake$qualified]))
+
+
+n_daily <- nrow(daily)
+n_biweekly <- nrow(biweekly)
+n_sessions <- (nrow(nintendo) + nrow(xbox) + nrow(steam))
+n_hours <- (
+  sum(nintendo$duration, na.rm = TRUE) +
+  sum(xbox$duration, na.rm = TRUE) +
+  sum(steam$minutes, na.rm = TRUE) +
+  sum(ios$minutes, na.rm = TRUE) +
+  sum(android$minutes, na.rm = TRUE)) /
+  60
+
+n_platforms <- table(
+  str_count(
+    intake$linked_platforms[!is.na(intake$linked_platforms)],
+    ","
+  ) +
+    1
+)
+
+n_hours <- sum(daily_telemetry$minutes / 60)
+n_users <- length(unique(daily_telemetry$pid))
+n_games <- length(unique(hourly_telemetry$title_id))
+n_months <- round(max(telemetry_spans$n_weeks) / 4.2)
+n_surveys <- nrow(daily) + nrow(biweekly)
+n_simon <- nrow(simon)
+
+prop_third_party <- (1 - median(intake$nintendo_first_party_prop, na.rm = T)) * 100
+prop_failed_daily_attn <- (sum(daily_raw$bpnsfs_failed_att_check) / nrow(daily_raw)) * 100
+prop_failed_biweekly_attn <- (sum(biweekly_raw$bangs_failed_att_check) / nrow(biweekly_raw)) * 100
+
+# no. invalid sessions (shopping, videos, etc.)
+prop_invalid_xbox <- (1 - (nrow(xbox_valid_sessions) / nrow(xbox_raw))) * 100
+prop_invalid_nintendo <- (1 - (nrow(nintendo_valid_sessions) / nrow(nintendo_raw))) * 100
+
+# no. suspicious sessions (1 - proportion of clean session after removing long hour sessions)
+prop_suspicious_xbox <- (1 - (nrow(xbox) / nrow(xbox_valid_sessions))) * 100
+prop_suspicious_nintendo <- (1 - (nrow(nintendo) / nrow(nintendo_valid_sessions))) * 100
+
+prop_dropped_timeuse <- (1 - (nrow(time_use) / nrow(read_csv("data/open-play/raw/timeuse_raw.csv.gz")))) * 100
+
+n_timeuse_entries_per_day <- time_use |>
+    group_by(pid, date) |>
+    summarise(n_activites = n()) |>
+    summarise(median = median(n_activites, na.rm = TRUE)) |>
+    summarise(median = median(median, na.rm = TRUE)) |>
+    pull(median)
+
+
+# This was wrong in the paper? see code chunk below
+platforms_count <- str_count(
+  replace_na(intake$linked_platforms[intake$qualified], ""),
+  ","
+) + 1 # single platform won't have a ','
+n_one_platform <- sum(platforms_count == 1, na.rm = TRUE)
+n_two_platforms <- sum(platforms_count == 2, na.rm = TRUE)
+n_three_platforms <- sum(platforms_count >= 3, na.rm = TRUE)
+
+# Steam quality metrics
+steam_qc <- read_csv(
+  "data/open-play/qc/steam_quality_metrics.csv",
+  show_col_types = FALSE
+)
+prop_steam_hours_exceeding <- steam_qc$prop_hours_exceeding * 100
+prop_steam_segments_scaled <- steam_qc$prop_segments_scaled * 100
+
+mean_minutes_reduced <- steam_qc$mean_minutes_reduced
+median_minutes_reduced <- steam_qc$median_minutes_reduced
+```
+
+
+There are 2544 qualified participants, but only 1948 that took part in the surveys.
+This number is still different to the one specified in the paper (1978), however, it is then correct in the Table 4 of the paper.
+Interestingly, there are only 1840 qualified participants in the intake data, not the 1900.
+
+There also appears to be a discrepancy in the `linked_platforms` and `used_platforms`: by adding 1 to the platform counts, NA values are automatically assigned a 1, which is confusing:
+```{r}
+intake |> select(pid, qualified, linked_platforms, used_platforms) |> 
+  mutate(
+    in_xbox = pid %in% xbox$pid,
+    in_steam = pid %in% steam$pid,
+    in_nintendo = pid %in% nintendo_valid_sessions$pid,
+    in_ios = pid %in% ios$pid,
+    in_android = pid %in% android$pid
+  ) |>
+  filter(qualified, is.na(linked_platforms))
+```
+These people must have been qualified to participate in the survey, but did not link any of their platforms, and were dropped from subsequent stages of the study.
+
+# Context & Goals
+
+Prof. Paul Cairns is really interested in any potential differences between people with ADHD and other players.
+There are also well-being measures including a measure for depression - it could be interesting to see to what extent how people play interacts with how well they are doing more generally. 
+
+# Exploring the demographics
+
+First, let's get an idea of the participants that took part in the surveys and the data set.
+
+```{r}
+demographic_vars <- c(
+  "country",
+  "geo_area",
+  "age",
+  "gender_clean",
+  "height",
+  "weight",
+  "ethnicity_clean",
+  "edu_level_clean",
+  "employment_clean",
+  "marital_status_clean",
+  "political_party_clean"
+)
+neuro_flag_vars <- c(
+  "is_neurotypical",
+  "is_adhd",
+  "is_dyscalculia",
+  "is_dyspraxia",
+  "is_ocd",
+  "is_prefer_not_say",
+  "is_specific_ld",
+  "is_neuro_diagnosed",
+  "is_asd",
+  "is_dyslexia",
+  "is_nvld",
+  "is_other",
+  "is_spd",
+  "is_tourette"
+)
+platform_flags <- c(
+  "plays_xbox",
+  "plays_steam",
+  "plays_nintendo",
+  "plays_ios",
+  "plays_android",
+  "plays_playstation"
+)
+str(qual_intake)
+head(qual_intake)
+tail(qual_intake)
+summary(qual_intake)
+```
+
+## Missing Data Analysis
+
+```{r}
+na_count <- sapply(qual_intake, function(col) sum(length(which(is.na(col)))))
+na_prop <- sapply(na_count, function(count) round(count / nrow(qual_intake), digits = 3))
+intake_na <- data.table(na_count, na_prop, keep.rownames = TRUE) |> rename(variable = rn)
+
+intake_na[order(intake_na$na_prop, decreasing = TRUE)]
+
+aggr(qual_intake[, demographic_vars],
+     sortVar = TRUE,
+     numbers = TRUE,
+     prop = FALSE,
+     cex.lab = 1,
+     cex.axis = 0.5,
+     cex.numbers = 0.7
+)
+```
+The cleaned intake data contains `{r} n_miss(qual_intake)` missing values, which is `{r} pct_miss(qual_intake)`%.
+This is due to all well-being and neurodiverse condition measures being empty in the initial intake data.
+The variables starting with `neuro` are NA if a person does not select that survey item.
+There are 110 rows only missing height and weight, this seems like a refusal.
+There are 40 rows not declaring an ethnicity.
+The rest of the demographic missingness appears to be individuals not disclosing their information, but I will check these instances for any unusual records to be sure:
+
+```{r}
+
+```
+
+
+### Descriptive Statistics
+
+```{r}
+qual_intake |>
+  select(age, height, weight, gender_clean, ethnicity_clean, country, edu_level_clean) |>
+  tbl_summary(
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd}) [{min}, {max}]",
+      all_categorical() ~ "{n} / {N} ({p}%)"
+    ),
+    missing = "ifany"
+  ) |>
+  bold_labels() |>
+  modify_header(label = "**Variable**")
+```
+
+
+```{r}
+table(qual_intake$gender_clean, useNA = "ifany")
+table(qual_intake$ethnicity_clean, useNA = "ifany")
+table(qual_intake$political_party_clean, useNA = "ifany")
+table(qual_intake$edu_level_clean, useNA = "ifany")
+
+# barplot of gender and ADHD
+qual_intake |> count(gender_clean, is_adhd) |> mutate(prop = n / sum(n)) |>
+  ggplot(aes(x = gender_clean, y = prop, fill = is_adhd)) +
+  geom_col(position = "dodge") +
+  geom_text(
+    aes(label = n),
+    position = position_dodge(width = 0.9),
+    vjust = -0.5
+  ) +
+  labs(title = "Proportion of genders in qualified participants, coloured by ADHD indicator")
+
+# barplot of ethnicity and adhd (proportion of ethnicity)
+qual_intake |> count(ethnicity_clean, is_adhd) |> group_by(ethnicity_clean) |> mutate(prop = n / sum(n)) |>
+  ggplot(aes(x = ethnicity_clean, y = prop, fill = is_adhd)) +
+  geom_col(position = "dodge") +
+  geom_text(
+    aes(label = n),
+    position = position_dodge(width = 1),
+    hjust = -0.5
+  ) +
+  coord_flip() +
+  labs(title = "Proportion of ethnicities in qualified participants, by ADHD indicator", y = "% of ethnic group")
+
+# barplot of video games platforms played
+qual_intake_platforms <- qual_intake |>
+  select(pid, starts_with("plays")) |>
+  pivot_longer(
+    cols = starts_with("plays_"),
+    names_to = "platform",
+    values_to = "play"
+  ) |>
+  mutate(
+    play = as.integer(play),
+    platform = str_replace(platform, "plays_", "")
+  )
+
+# pairplot of age, height, weight coloured by gender
+qual_intake |> select(age, height, weight, gender_clean) |>
+  ggpairs(
+    aes(colour = gender_clean),
+    columns = c("age", "height", "weight")
+  )
+
+# distribution of age by gender
+ggplot(qual_intake, aes(x = age)) +
+  geom_histogram() +
+  facet_wrap(vars(gender_clean)) +
+  labs(
+    title = "Age distribution by gender",
+    x = "age",
+    y = "density",
+  )
+
+# distribution of platforms
+qual_intake_platforms |>
+  group_by(platform) |>
+  summarise(count = sum(play)) |>
+  ggplot(aes(x = fct_reorder(platform, count), y = count)) +
+  geom_col() +
+  labs(title = "Platform Frequency of qualified participants") +
+  coord_flip()
+
+# employment status (with ADHD)
+qual_intake |>
+  filter(!is.na(employment_clean)) |>
+  count(employment_clean, is_adhd) |>
+  mutate(employment_clean = fct_reorder(employment_clean, n)) |>
+  ggplot(aes(x = n, y = employment_clean, fill = is_adhd)) +
+  geom_col() +
+  labs(
+    x = "Count",
+    y = "Employment status",
+    title = "Employment status of qualified participants"
+  )
+
+# level of education
+qual_intake |>
+  count(edu_level_clean) |>
+  mutate(edu_level_clean = fct_reorder(edu_level_clean, n)) |>
+  ggplot(aes(y = edu_level_clean, x = n)) +
+  geom_col() +
+  labs(
+    title = "Highest level of education of qualified participants"
+  )
+
+# employment status with gender
+qual_intake |>
+  filter(!is.na(employment_clean)) |>
+  count(employment_clean, gender_clean) |>
+  mutate(employment_clean = fct_reorder(employment_clean, n)) |>
+  ggplot(aes(x = n, y = employment_clean)) +
+  geom_col() +
+  labs(
+    x = "Count",
+    y = "Employment status",
+    title = "Employment status of qualified participants"
+  ) +
+  facet_grid(rows = vars(gender_clean))
+
+# trends between platform and adhd
+qual_intake_platforms |>
+  left_join(qual_intake |> select(pid, gender_clean, is_adhd), by = join_by(pid)) |>
+  group_by(gender_clean, platform) |>
+  summarise(count = sum(play), prop = count / n()) |>
+  ggplot(aes(x = fct_reorder(platform, prop), y = prop)) +
+  geom_col(position = position_dodge()) +
+  facet_grid(rows = vars(fct_reorder(gender_clean, prop, .desc = TRUE))) +
+  labs(x = "platform", y = "% of gender", title = "Proportion of gender playing games on a platform") +
+  coord_flip()
+```
+
+We can see the following: a larger proportion of qualified women in the dataset have ADHD compared to men,
+a third of white participants have ADHD, a quarter of multiple ethnicities have ADHD, the Asian ethnic group had the smallest proportion of people with ADHD, steam is the most popular platform to play followed by Nintendo, nearly 50% of women played on their Nintendo device compared to roughly 30% of men.
+
+Additionally, most of the qualified participants are in their 20s, working full time or unemployed.
+
