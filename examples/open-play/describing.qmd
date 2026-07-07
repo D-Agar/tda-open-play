@@ -1,0 +1,7 @@
+---
+title: "Describing and Understanding Open Play: Post-cleaning"
+format: html
+---
+
+This follows on from `cleaning.qmd`, where I focused on understanding the participants and the general demographics of the participants.
+Here, I begin to understand the data, gaining more deeper insights and exploring the telemetry data of the qualified participants.

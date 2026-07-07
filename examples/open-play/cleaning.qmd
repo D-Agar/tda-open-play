@@ -1,0 +1,1307 @@
+---
+title: "Open Play: Data Understanding"
+author: "Daniel Agar"
+format: html
+abstract: "This document contains the initial exploration of the Open Play dataset, which has already been cleaned"
+---
+
+This document explores the clean version of the data set Open Play.
+This is to help me get a better understanding of the data I will be working with for my MSc dissertation.
+The cleaning process consisted of the following:
+- Steam:
+  -Removed idle games or non games (SteamVR, soundpad, etc.),
+  - Added approximate session times
+  - Scaled sessions over an hour
+  - Boolean indicator for new sessions
+  - Added number of hours sessions lasted
+  - Calculated metrics for each session/game id
+  - Created quality metrics (separate file containing information about the scaled instances)
+- Xbox:
+  - Merge adjacent sessions that are within a threshold (60 seconds)
+  - Remove non-game sessions (shopping/videos)
+  - Remove suspiciously long sessions (more than 6 hours)
+  - Merges adjacent sessions by splitting into lots of atomic sessions and merging
+- Nintendo:
+  - Filter duplicates
+  - Merge adjacent sessions with a minute tolerance
+- Android: simple renaming
+- iOS: simple renaming
+- Excludes entries where total gaming for a day is more than 16 hours
+- intake:
+  - Self-reported hours > 50, NA
+  - Remove duplicates of linked_platforms
+- daily:
+  - Remove daily duplicates of survey
+  - Recode erroneous wave codings by their start date
+  - Ignore "false starts" of game data (outside date range)
+- bikweekly:
+  - Remove daily duplicates of survey
+  - Recode erroneous wave codings by their start date
+  - Ignore "false starts" of game data (outside date range)
+- timeuse: assign quality flags to diaries
+  - No mention of sleep or personal care
+  - No sleep
+  - More than 90 minutes unacounted for
+  - Less than 5 activites logged during a day
+- simon:
+  - Only include non-pilot-study participants (weren't in initial pre-trial) who qualified at intake
+
+```{r} 
+#| label: libraries
+#| include: false
+#| code-summary: "Show code (Load required R packages)"
+library(tidyverse)
+library(data.table)
+library(dtplyr)
+library(naniar)
+library(gtsummary)
+library(GGally)
+library(patchwork)
+library(VIM)
+library(mice)
+library(ggmice)
+library(car)
+
+theme_set(theme_minimal())
+source("examples/open-play/helpers.R")
+```
+
+I will fetch the cleaned datasets:
+```{r}
+#| label: data setup
+#| include: false
+#| cache: true
+android <- read_csv("data/open-play/clean/android.csv.gz")
+metadata <- read_csv("data/open-play/clean/game_metadata.csv.gz")
+ios <- read_csv("data/open-play/clean/ios.csv.gz")
+nintendo <- read_csv("data/open-play/clean/nintendo.csv.gz")
+simon <- read_csv("data/open-play/clean/simon.csv.gz")
+steam <- read_csv("data/open-play/clean/steam.csv.gz")
+steam_visibility <- read_csv("data/open-play/raw/telemetry_steam_account_linking_raw.csv.gz")
+biweekly <- read_csv("data/open-play/clean/biweekly.csv.gz")
+daily <- read_csv("data/open-play/clean/daily.csv.gz", guess_max = 10000)
+intake <- read_csv("data/open-play/clean/intake.csv.gz", guess_max = 34000)
+time_use <- read_csv("data/open-play/clean/timeuse.csv.gz") |>
+  filter(quality_flag == "Good quality")
+xbox <- read_csv("data/open-play/clean/xbox.csv.gz")
+
+xbox_raw <- read_csv("data/open-play/raw/telemetry_xbox_raw.csv.gz")
+nintendo_raw <- read_csv("data/open-play/raw/telemetry_nintendo_raw.csv.gz")
+daily_raw <- read_csv("data/open-play/raw/survey_daily_raw.csv.gz")
+biweekly_raw <- read_csv("data/open-play/raw/survey_biweekly_raw.csv.gz", guess_max = 5000)
+time_use_raw <- read_csv("data/open-play/raw/timeuse_raw.csv.gz")
+```
+
+```{r}
+#| label: data-prep
+#| cache: true
+# clean most likely to use columns
+steam_visibility <- steam_visibility |>
+  filter(platform == "steam") |>
+  mutate(
+    timestamp = as_datetime(timestamp, tz = "UTC"),
+    is_public = event == "steamDataPublic"
+  ) |>
+  select(pid, timestamp, event, is_public)
+
+# import raw data for calculating how many rows were excluded
+xbox_valid_sessions <- xbox_raw |>
+  merge_adjacent_sessions(tol_sec = 60) |>
+  # filter non-foreground games
+  filter(
+    duration >= 1,
+    pid %in% intake$pid,
+    title_placement == "Full", # in foreground
+    !genres %in% c("Shopping", "Video", "Entertainment", "Utilities & tools"),
+    tolower(title_id) != "e1924c10-9c91-4652-81b9-8ca0670e77a7" # home screen
+  )
+
+nintendo_valid_sessions <- nintendo_raw |>
+  distinct() |>
+  filter(
+    pid %in% intake$pid,
+    duration >= 1
+  ) |>
+  merge_adjacent_sessions(tol_sec = 60)
+```
+
+Now I shall select the qualified participants, as I know I will have more data to analyse.
+These participants are known to have completed at least one (biweekly) survey.
+
+```{r}
+#| label: aggregate-session-hourly-daily
+#| cache: true
+# merge with the local time zone offsets from intake
+# Note: We keep country and local_timezone for DST-aware conversion
+tz_map <- intake |>
+  mutate(
+    pid,
+    country,
+    local_timezone,
+    .keep = "none"
+  ) |>
+  distinct(pid, .keep_all = TRUE)
+
+# aggregate data at each level of granularity (session, hourly, daily)
+# session level (Nintendo and Xbox)
+session_telemetry <- bind_rows(
+    xbox |> mutate(platform = "Xbox"),
+    nintendo |> mutate(platform = "Nintendo")
+  ) |>
+  left_join(tz_map, by = "pid") |>
+  filter(!is.na(local_timezone)) |>
+  mutate(
+    # Calculate DST-aware offset for each timestamp
+    offset_start = get_dst_offset(session_start, country, local_timezone),
+    offset_end = get_dst_offset(session_end, country, local_timezone),
+    # Add offset to get local time values (keeping UTC label for compatibility)
+    start_local = session_start + offset_start,
+    end_local = session_end + offset_end,
+    duration_min = as.numeric(difftime(
+      session_end,
+      session_start,
+      units = "mins"
+    ))
+  ) |>
+  filter(
+    !is.na(session_start),
+    !is.na(session_end),
+    session_end > session_start,
+    duration_min >= 1
+  )
+
+# Hourly (Nintendo and Xbox)
+# expand sessions into local-hour bins, compute overlap minutes, and add UTC hour
+hourly_from_sessions <- session_telemetry |>
+  filter(!is.na(start_local), !is.na(end_local)) |>
+  mutate(
+    h0_local = floor_date(start_local, "hour"),
+    h1_local = floor_date(end_local - seconds(1), "hour"),
+    n_hours = as.integer(difftime(h1_local, h0_local, units = "hours")) + 1
+  ) |>
+  filter(!is.na(n_hours), n_hours > 0) |>
+  tidyr::uncount(n_hours, .remove = FALSE, .id = "k") |>
+  mutate(
+    hour_start_local = h0_local + hours(k - 1),
+    minutes = pmax(
+      0,
+      as.numeric(difftime(
+        pmin(end_local, hour_start_local + hours(1)),
+        pmax(start_local, hour_start_local),
+        units = "mins"
+      ))
+    ),
+    # Convert back to UTC (this preserves the instant, just changes label)
+    hour_start_utc = with_tz(hour_start_local, tzone = "UTC")
+  ) |>
+  select(pid, platform, title_id, hour_start_local, hour_start_utc, minutes) |>
+  group_by(pid, platform, title_id, hour_start_local, hour_start_utc) |>
+  summarise(minutes = sum(minutes, na.rm = TRUE), .groups = "drop")
+
+hourly_from_steam <- steam |>
+  mutate(
+    datetime_hour_start = ymd_hms(
+      paste0(date, " ", sprintf("%02d", hour), ":00:00"),
+      tz = "UTC"
+    )
+  ) |>
+  select(pid, title_id, datetime_hour_start, minutes) |>
+  left_join(tz_map, by = "pid") |>
+  filter(!is.na(local_timezone)) |>
+  mutate(
+    platform = "Steam",
+    hour_start_utc = datetime_hour_start,
+    offset = get_dst_offset(datetime_hour_start, country, local_timezone),
+    # Note: These are local time values with UTC labels due to R's POSIXct limitation
+    hour_start_local = datetime_hour_start + offset
+  ) |>
+  select(pid, platform, title_id, hour_start_local, hour_start_utc, minutes) |>
+  group_by(pid, platform, title_id, hour_start_local, hour_start_utc) |>
+  summarise(minutes = sum(minutes, na.rm = TRUE), .groups = "drop")
+
+hourly_telemetry <- bind_rows(hourly_from_sessions, hourly_from_steam)
+
+# Daily (Nintendo + Xbox + Steam; collapse hourly to days)
+daily_telemetry <- hourly_telemetry |>
+  mutate(
+    day_local = as.Date(hour_start_local),
+  ) |>
+  group_by(pid, platform, day_local) |>
+  summarise(minutes = sum(minutes, na.rm = TRUE), .groups = "drop") |>
+  bind_rows(ios) |>
+  bind_rows(android)
+
+# Weekly
+weekly_all <- daily_telemetry |>
+  mutate(
+    week = floor_date(day_local, "week")
+  ) |>
+  group_by(pid, platform, week) |>
+  summarise(minutes = sum(minutes, na.rm = TRUE), .groups = "drop")
+
+telemetry_spans <- daily_telemetry |>
+  group_by(pid, platform) |>
+  summarise(
+    telemetry_start = min(day_local, na.rm = TRUE),
+    telemetry_end = max(day_local, na.rm = TRUE) + hours(1), # end of last hour bin
+    week = floor_date(telemetry_end, "week"),
+    n_weeks = as.integer(difftime(
+      telemetry_end,
+      telemetry_start,
+      units = "weeks"
+    )) +
+      1,
+    .groups = "drop"
+  )
+```
+
+```{r}
+#| label: participant-summary-stats
+#| cache: true
+
+# participants
+n_baseline <- nrow(intake[intake$qualified, ])
+# participants in surveys
+n_participants <- sum(unique(c(daily$pid, biweekly$pid)) %in% intake$pid)
+n_participants_biweekly <- sum(unique(c(biweekly$pid)) %in% intake$pid)
+n_participants_daily <- sum(unique(c(daily$pid)) %in% intake$pid)
+
+participant_age <- (function(x) {
+  sprintf(
+    "%s years old (10th percentile: %s, 90th percentile: %s)",
+    print_num(median(x), .1),
+    print_num(quantile(x, 0.10), .1),
+    print_num(quantile(x, 0.90), .1)
+  )
+})(na.omit(intake$age[intake$qualified]))
+
+n_daily <- nrow(daily)
+n_biweekly <- nrow(biweekly)
+n_sessions <- (nrow(nintendo) + nrow(xbox) + nrow(steam))
+n_hours <- (
+  sum(nintendo$duration, na.rm = TRUE) +
+  sum(xbox$duration, na.rm = TRUE) +
+  sum(steam$minutes, na.rm = TRUE) +
+  sum(ios$minutes, na.rm = TRUE) +
+  sum(android$minutes, na.rm = TRUE)) /
+  60
+
+n_platforms <- table(
+  str_count(
+    intake$linked_platforms[!is.na(intake$linked_platforms)],
+    ","
+  ) +
+    1
+)
+
+n_hours <- sum(daily_telemetry$minutes / 60)
+n_users <- length(unique(daily_telemetry$pid))
+n_games <- length(unique(hourly_telemetry$title_id))
+n_months <- round(max(telemetry_spans$n_weeks) / 4.2)
+n_surveys <- nrow(daily) + nrow(biweekly)
+n_simon <- nrow(simon)
+
+prop_third_party <- (1 - median(intake$nintendo_first_party_prop, na.rm = T)) * 100
+prop_failed_daily_attn <- (sum(daily_raw$bpnsfs_failed_att_check) / nrow(daily_raw)) * 100
+prop_failed_biweekly_attn <- (sum(biweekly_raw$bangs_failed_att_check) / nrow(biweekly_raw)) * 100
+
+# no. invalid sessions (shopping, videos, etc.)
+prop_invalid_xbox <- (1 - (nrow(xbox_valid_sessions) / nrow(xbox_raw))) * 100
+prop_invalid_nintendo <- (1 - (nrow(nintendo_valid_sessions) / nrow(nintendo_raw))) * 100
+
+# no. suspicious sessions (1 - proportion of clean session after removing long hour sessions)
+prop_suspicious_xbox <- (1 - (nrow(xbox) / nrow(xbox_valid_sessions))) * 100
+prop_suspicious_nintendo <- (1 - (nrow(nintendo) / nrow(nintendo_valid_sessions))) * 100
+
+prop_dropped_timeuse <- (1 - (nrow(time_use) / nrow(time_use_raw))) * 100
+
+n_timeuse_entries_per_day <- time_use |>
+    group_by(pid, date) |>
+    summarise(n_activites = n()) |>
+    summarise(median = median(n_activites, na.rm = TRUE)) |>
+    summarise(median = median(median, na.rm = TRUE)) |>
+    pull(median)
+
+
+# This was wrong in the paper? see code chunk below
+platforms_count <- str_count(
+  replace_na(intake$linked_platforms[intake$qualified], ""),
+  ","
+) + 1 # single platform won't have a ','
+linked_platforms_raw_qual <- intake$linked_platforms[intake$qualified]
+platforms_count_fix <- if_else(
+  is.na(linked_platforms_raw_qual) | trimws(linked_platforms_raw_qual) == "",
+  0,
+  str_count(replace_na(linked_platforms_raw_qual, ""), ",") + 1
+)
+n_one_platform <- sum(platforms_count == 1, na.rm = TRUE)
+n_two_platforms <- sum(platforms_count == 2, na.rm = TRUE)
+n_three_platforms <- sum(platforms_count >= 3, na.rm = TRUE)
+
+# Steam quality metrics
+steam_qc <- read_csv(
+  "data/open-play/qc/steam_quality_metrics.csv",
+  show_col_types = FALSE
+)
+prop_steam_hours_exceeding <- steam_qc$prop_hours_exceeding * 100
+prop_steam_segments_scaled <- steam_qc$prop_segments_scaled * 100
+
+mean_minutes_reduced <- steam_qc$mean_minutes_reduced
+median_minutes_reduced <- steam_qc$median_minutes_reduced
+```
+
+There are `{r} n_baseline` qualified participants and `{r} n_participants` took part in the surveys.
+Out of the `{r} n_participants`, `{r} n_participants_biweekly` completed the biweekly surveys, and `{r} n_participants_daily` did the daily surveys.
+
+For future reference, the variable `eligible_platforms` contains all platforms that can be used for telemetry.
+```{r}
+#| label: eligible-platforms
+table(intake$eligible_platforms, useNA = 'ifany')
+```
+
+The people that did not link their video game services, but were eligible, were initially classified as "Elected not to link".
+Additionally, the participants did end up recording their telemetry, as seen in Figure 1 of the Open Play paper.
+Therefore, this finding simply indicates the participants at the time elected to not link, but did in the end.
+
+# Intake Data
+```{r}
+#| label: set-intake-data
+intake_participants <- intake |> filter(pid %in% unique(c(daily$pid, biweekly$pid)))
+intake_qualified <- intake |> filter(qualified)
+```
+
+
+First, let's get an idea of the participants that took part in the surveys (both daily and biweekly).
+
+```{r}
+print(str(intake_participants, list.len = Inf, vec.len = 3))
+print(summary(intake_participants))
+```
+## Missing Data Analysis
+
+```{r}
+#| label: intake-na
+na_count <- unlist(colSums(is.na(intake_participants)))
+na_prop <- unlist(round(colMeans(is.na(intake_participants)) * 100, 2))
+intake_na <- data.table(variable = colnames(intake_participants), na_count, na_prop)
+
+tot_na_count <- n_miss(intake_participants)
+tot_na_pct <- pct_miss(intake_participants)
+
+intake_na |> arrange(-na_count)
+```
+
+## Demographics
+
+
+```{r}
+#| label: na-plot-demographic
+# exploring demographic variable missingness
+demographic_vars <- c(
+  "country",
+  "geo_area",
+  "age",
+  "gender",
+  "height",
+  "weight",
+  "ethnicity",
+  "edu_level",
+  "employment",
+  "marital_status",
+  "political_party",
+  "dependents",
+  "neuro_diagnosed",
+  "neuro_identify"
+)
+
+intake_na |> filter(variable %in% demographic_vars) |> arrange(-na_count)
+
+
+aggr(
+  intake_participants[, demographic_vars],
+  sortVar = TRUE,
+  numbers = TRUE,
+  prop = FALSE,
+  cex.lab = 1,
+  cex.axis = 0.5,
+  cex.numbers = 0.5
+)
+
+vis_miss(intake_participants[, demographic_vars]) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 0, vjust = 0),
+    margins = margin(r = 50, b = 5)
+  )
+```
+We can see that the main variables missing data are dependents and neuro_diagnosed.
+
+### Cleaning
+
+I will clean the variables that are not missing, but have lots of varied responses (country, geo_area, age, gender, edu_level, marital_status, political_party, neuro_identify).
+
+#### Country
+
+```{r}
+#| label: county-tabs
+
+table(intake_participants$country, useNA = "ifany")
+```
+There is nothing to be done with country.
+
+#### Geographic Area of Residence
+
+```{r}
+#| label: geo_area-tabs
+
+table(intake_participants$geo_area, useNA = "ifany")
+```
+The US codes look fine, but the UK should be capitalised.
+```{r}
+#| label: geo_area-clean
+
+intake_participants <- intake_participants |> 
+  mutate(
+    geo_area_original = geo_area,
+    geo_area = str_to_upper(geo_area)
+  )
+```
+That reduced nearly 40 of the possible values.
+
+#### Age
+
+```{r}
+#| label: age-tabs
+
+table(intake_participants$age, useNA = "ifany")
+```
+Nothing to do with age.
+
+#### Gender
+
+```{r}
+#| label: gender-tabs
+
+table(intake_participants$gender, useNA = "ifany")
+```
+I will convert the values to fewer scales for easier analysis (not Man/Woman/Non-binary/Questioning/Other).
+The number of transgender and individual non-binary identities are too few to be put as their own response groups, as this may cause bias in future modelling.
+Therefore, I will group gender into the following: Male/Female/Non-binary/Other.
+Prefer not to say shall be converted to NA, especially as there are only 3.
+```{r}
+#| label: gender-clean
+
+intake_participants <- intake_participants |> 
+  mutate(
+    gender_original = gender,
+    gender = str_to_lower(gender_original),
+    gender = case_when(
+      grepl("woman", gender, fixed = TRUE) ~ "Woman",
+      grepl("agender", gender, fixed = TRUE) |
+        grepl("they|them", gender) |
+        grepl("demi", gender, fixed = TRUE) |
+        grepl("bi", gender, fixed = TRUE) |
+        grepl("gender.*fluid", gender) |
+        grepl("non.*binary", gender) ~ "Non-binary",
+      grepl("man", gender, fixed = TRUE) ~ "Man",
+      gender == "prefer not to say" ~ "Prefer not to say",
+      TRUE ~ NA_character_
+    )
+  )
+
+table(intake_participants$gender, useNA = "ifany")
+
+intake_participants |> select(gender, gender_original) |>
+  count(gender, gender_original) |> print()
+```
+
+#### Education Level
+
+I will make this data ordinal, as then this could be used for future work.
+This will also involve grouping some of the variables together (Highschool diploma/some college)
+
+```{r}
+#| label: edu_level-tabs
+
+table(intake_participants$edu_level, useNA = "ifany")
+```
+
+Values according to the codebook: Less than a high school diploma or equivalent; High school graduate or equivalent; Some college but no degree; Associate degree; Bachelor's degree; Master's degree, professional degree, or doctoral degree; Prefer not to say
+
+Also note that "prefer not to say" is being encoded as NA.
+```{r}
+#| label: edu_level-clean
+
+old_edu <- intake_participants$edu_level
+intake_participants$edu_level_original <- old_edu
+
+intake_participants <- intake_participants |>
+  mutate(
+    edu_level = case_when(
+      edu_level_original %in% c(
+        "Less than a high school diploma or equivalent", 
+        "Completed Primary School"
+      ) ~ "Below High School",
+      edu_level_original %in% c(
+        "High school graduate or equivalent",
+        "Completed Secondary School"
+      ) ~ "High School",
+      edu_level_original == "Vocational or Similar" ~ "Vocational or Similar",
+      edu_level_original %in% c(
+        "Some University but no degree",
+        "Some college but no degree"
+      ) ~ "Higher education but no degree",
+      edu_level_original == "Associate degree" ~ "Associate degree",
+      edu_level_original %in% c(
+        "Bachelor's degree",
+        "University Bachelors Degree",
+        "Higher National Certificate, Higher National Diploma, Bachelor's degree, or post-graduate qualifications"
+      ) ~ "Bachelors degree",
+      edu_level_original %in% c(
+        "Master's degree, professional degree, or doctoral degree",
+        "Graduate or professional degree (MA, MS, MBA, PhD, etc)"
+      ) ~ "Postgraduate",
+      edu_level_original == "Prefer not to say" ~ "Prefer not to say",
+      TRUE ~ NA_character_
+    )
+  )
+
+print(intake_participants |> count(edu_level), n = Inf)
+```
+
+#### Ethnicity
+
+```{r}
+#| label: ethnicity-tabs
+
+table(intake_participants$ethnicity, useNA = "ifany")
+```
+
+I will create the following groups: White, Black, Asian, Native Hawaiian, Mixed, Other, American Indian, Prefer not to say (as NA):
+
+```{r}
+#| label: ethnicity-clean
+
+ethnicity_old <- intake_participants$ethnicity
+intake_participants$ethnicity_original <- ethnicity_old
+
+intake_participants <- intake_participants |> 
+  mutate(
+    ethnicity = ethnicity_original,
+    ethnicity = case_when(
+      ethnicity %in% c("White alone", "White") ~ "White",
+      ethnicity %in% c(
+        "Black",
+        "Black, African, Caribbean or Black British",
+        "Black or African American alone"
+      ) ~ "Black",
+      ethnicity %in% c(
+        "Asian",
+        "Asian alone",
+        "Asian or Asian British"
+      ) ~ "Asian",
+      ethnicity %in% c(
+        "Mixed",
+        "Mixed or multiple ethnic groups",
+        "Two or More Races"
+      ) ~ "Multiple",
+      ethnicity == "American Indian and Alaska Native alone" ~ "American Indian and Alaska Native",
+      ethnicity == "Native Hawaiian and Other Pacific Islander alone" ~ "Native Hawaiian and Other Pacific Islander",
+      ethnicity == "Prefer not to say" ~ "Prefer not to say",
+      is.na(ethnicity) ~ NA_character_,
+      TRUE ~ "Other"
+    )
+  )
+
+table(intake_participants$ethnicity, useNA = "ifany")
+
+intake_eth_na <- intake_participants |> 
+  filter(is.na(ethnicity))
+
+intake_participants |> 
+  mutate(ethnicity_na = is.na(ethnicity)) |>
+  select(panel_source, ethnicity_na) |>
+  table()
+
+eth_na_dates <- intake_participants |> filter(is.na(ethnicity)) |>
+  mutate(date = as.Date(date)) |> 
+  pull(date)
+```
+
+The rest of the ethnicity missingness is when using prolific data, specifically all on the 26th September 2024, except for one which appears to be refusal.
+The participants (excluding the one anomaly) were pilot participants and also all part of Prolific.
+They were evenly distributed across the countries, but all also linked steam.
+This seems like some form of error in responses, indicating MNAR.
+
+These shall be recoded as simply "Not reported".
+
+```{r}
+intake_participants <- intake_participants |> 
+  mutate(
+    ethnicity = if_else(is.na(ethnicity), "Not reported", ethnicity)
+  )
+
+table(intake_participants$ethnicity, useNA = "ifany")
+```
+
+
+#### Martial Status
+```{r}
+#| label: marital-status-tabs
+
+table(intake_participants$marital_status, useNA = "ifany")
+```
+Everything, except one instance, of "Other" is actually just single, by definition of marital status.
+
+```{r}
+#| label: marital-status-clean
+
+old_marital_status <- intake_participants$marital_status
+
+intake_participants$marital_status_original <- old_marital_status
+
+intake_participants <- intake_participants |> 
+  mutate(
+    marital_status = marital_status_original,
+    marital_status = case_when(
+      marital_status == "Married" ~ "Married",
+      marital_status == "In a domestic partnership or civil union" ~ "In a domestic partnership or civil union",
+      grepl("separated", str_to_lower(marital_status), fixed = TRUE) ~ "Separated",
+      marital_status == "Divorced" ~ "Divorced",
+      marital_status == "Widowed" ~ "Widowed",
+      marital_status == "Prefer not to say" ~ "Prefer not to say",
+      is.na(marital_status) ~ NA_character_,
+      TRUE ~ "Single, never married",
+    )
+  )
+
+table(intake_participants$marital_status, useNA = "ifany")
+```
+
+
+#### Political Party
+
+```{r}
+#| label: political-party-tabs
+
+table(intake_participants$political_party, useNA = "ifany")
+```
+
+Future note to self: I could try split the countries into smaller states/regions (wales/scotland).
+For now, I will just use the specified parties, not specifically handling the others (socialist, scottish greens).
+```{r}
+#| label: political-party-clean
+
+old_political_party <- intake_participants$political_party
+
+intake_participants$political_party_original <- intake_participants$political_party
+
+intake_participants <- intake_participants |> 
+  mutate(
+    political_party = political_party_original,
+    political_party = case_when(
+      # US
+      political_party == "Democratic Party" ~ "Democratic Party",
+      political_party == "Republican Party" ~ "Republican Party",
+      political_party == "Independent" ~ "Independent",
+ 
+      # UK
+      political_party == "Labour Party / Co-operative Party" ~ "Labour Party / Co-operative Party",
+      political_party == "Conservative and Unionist Party" ~ "Conservative and Unionist Party",
+      political_party == "Liberal Democrats" ~ "Liberal Democrats",
+      political_party == "Scottish National Party (SNP)" ~ "Scottish National Party (SNP)",
+      
+      political_party == "Sinn Féin" ~ "Sinn Féin",
+      political_party == "Reform UK" ~ "Reform UK",
+      political_party == "Democratic Unionist Party (DUP)" ~ "Democratic Unionist Party (DUP)",
+      political_party == "Green Party of England and Wales" ~ "Green Party of England and Wales",
+      political_party == "Plaid Cymru" ~ "Plaid Cymru",
+      political_party == "No affiliation / Independent" ~ "No affiliation / Independent",
+      str_detect(str_to_lower(political_party), paste(
+        "none", "unaffiliated", "no political affiliation", "not interested",
+        "apolitical", "non political", "i dont care", "non political",
+        "i dont pay enough attention to politics to know",
+        "not interested in politics",
+        sep = "|"
+      )) ~ "No affiliation / Independent",
+      
+      political_party == "Prefer not to say" ~ "Prefer not to say",
+      is.na(political_party) ~ NA_character_,
+
+      # "Anarcho communist", "scottish greens", "All bad"
+      TRUE ~ "Other"
+    )
+  )
+
+print(intake_participants |> count(political_party), n = Inf)
+```
+
+#### Employment
+
+```{r}
+#| label: employment-tabs
+
+table(intake_participants$employment, useNA = "ifany")
+```
+
+```{r}
+#| label: employment-clean
+
+old_employment <- intake_participants$employment
+
+intake_participants$employment_original <- old_employment
+
+intake_participants <- intake_participants |> 
+  mutate(
+    employment = employment_original,
+    employment = str_to_lower(employment),
+    employment = case_when(
+      employment == "working full-time" ~ "Working full-time",
+      employment == "working part-time" ~ "Working part-time",
+      employment == "not currently employed" ~ "Not currently employed",
+      employment == "a homemaker or stay-at-home parent" ~ "A homemaker or stay-at-home parent",
+      employment == "student" ~ "Student",
+      employment == "retired" ~ "Retired",
+      employment == "prefer not to say" ~ "Prefer not to say",
+      is.na(employment) ~ NA_character_,
+      TRUE ~ "Other"
+    )
+  )
+
+print(intake_participants |> count(employment), n = Inf)
+```
+The sole NA person self reported 600 minutes (10 hours of games) a week.
+I just want to investigate further:
+```{r}
+na_emp_pid <- intake_participants |> filter(is.na(employment)) |> pull(pid)
+
+na_emp_steam <- steam |> filter(pid == na_emp_pid)
+
+start_survey_date <- min(na_emp_steam$date)
+end_period <- start_survey_date + weeks(2)
+
+start_2week_playtime <- na_emp_steam |> 
+  filter(date >= start_survey_date & date < end_period)
+
+print(paste("Total playtime between ", start_survey_date, " and ", end_period, ": ", sum(start_2week_playtime$minutes)))
+
+start_2week_playtime |> 
+  group_by(date) |> 
+  summarise(daily_playtime = sum(minutes)) |> 
+  ggplot(aes(x = date, y = daily_playtime)) +
+  geom_line() +
+  scale_x_date(date_labels = "%a %d", breaks = scales::pretty_breaks(n = 14))
+```
+Check people's ethnicity from similar locations:
+```{r}
+na_emp <- intake_participants |> filter(is.na(employment))
+
+intake_participants |> 
+  filter(country == na_emp$country, geo_area == na_emp$geo_area)
+```
+I will therefore treat the response of "NA" to imply they are not currently employed:
+```{r}
+intake_participants <- intake_participants |> 
+  mutate(
+    employment = if_else(is.na(employment), "Not currently employed", employment)
+  )
+
+table(intake_participants$employment, useNA = "ifany")
+```
+
+
+### Missing Data
+The rest of the demographic missingness appears to be individuals not disclosing their information, but I will check these instances for any unusual records to be sure:
+
+```{r}
+# Neurodiverse flags
+# is_neurotypical = neuro_identify == "No" | is.na(neuro_identify),
+# is_adhd = !is.na(neuro_iden_adhd) | !is.na(neuro_diag_adhd),
+# is_dyscalculia = !is.na(neuro_iden_dyscalculia) | !is.na(neuro_diag_dyscalculia),
+# is_dyspraxia = !is.na(neuro_iden_dyspraxia) | !is.na(neuro_diag_dyspraxia),
+# is_ocd = !is.na(neuro_iden_ocd) | !is.na(neuro_diag_ocd),
+# is_prefer_not_say = !is.na(neuro_iden_prefer_not_say) | !is.na(neuro_diag_prefer_not_say),
+# is_specific_ld = !is.na(neuro_iden_specific_ld) | !is.na(neuro_diag_specific_ld),
+# is_neuro_diagnosed = !is.na(neuro_diagnosed),
+# is_asd = !is.na(neuro_iden_asd) | !is.na(neuro_diag_asd),
+# is_dyslexia = !is.na(neuro_iden_dyslexia) | !is.na(neuro_diag_dyslexia),
+# is_nvld = !is.na(neuro_iden_nvld) | !is.na(neuro_diag_nvld),
+# is_other = !is.na(neuro_iden_other) | !is.na(neuro_diag_other),
+# is_spd = !is.na(neuro_iden_spd) | !is.na(neuro_diag_spd),
+# is_tourette = !is.na(neuro_iden_tourette) | !is.na(neuro_diag_tourette),
+# # fix datetimes
+# enrollment_datetime = as_datetime(date, tz = "UTC"),
+# study_end_datetime = enrollment_datetime + days(84)
+# )
+```
+
+#### Dependents
+
+```{r}
+vis_miss(intake_participants |> select(demographic_vars, starts_with("care_"))) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 0, vjust = 0),
+    margins = margin(r = 50, b = 5)
+  )
+```
+Interestingly, the proportion of missing dependents is inverse to the proportion of people missing care_none (they don't care for anyone).
+This makes sense as people who do not care for anyone, will leave dependents blank.
+Dependents is based on the care variables:
+```{r}
+addmargins(xtabs(~ dependents + care_none, data = intake_participants, addNA = TRUE))
+```
+We can see that everyone who didn't answer dependents, indicated they did not have additional caregiving responsibilities.
+This is construct-missingness slightly, and is MAR, as the missingness is heavily dependent on factors such as marital status and age.
+
+I will recode NA dependent participants' "None" if they were answered the care_none variable.
+For full transparency in further analysis, I will also add a `imputed` flag to the dataset.
+
+```{r}
+intake_participants$dependents_original <- intake_participants$dependents
+intake_participants <- intake_participants |> 
+  mutate(
+    dependents_original = dependents,
+    dependents_imputed = if_else(
+      is.na(dependents) & !is.na(care_none),
+      1, 0
+    ),
+    dependents = case_when(
+      dependents_imputed == 1 ~ "None",
+      TRUE ~ dependents
+    )
+  )
+```
+
+```{r}
+addmargins(xtabs(~ dependents + care_children, data = intake_participants, addNA = TRUE))
+addmargins(xtabs(~ dependents + care_elderly, data = intake_participants, addNA = TRUE))
+addmargins(xtabs(~ dependents + care_disability, data = intake_participants, addNA = TRUE))
+addmargins(xtabs(~ dependents + care_prefer_not_say, data = intake_participants, addNA = TRUE))
+addmargins(xtabs(~ dependents + care_other, data = intake_participants, addNA = TRUE))
+```
+The final missing 17 rows are all when people responded to "prefer not to say" for care-giving abilities.
+I will leave these as is, rather than dropping them as they don't even account for 1% of the data.
+
+#### Height and Weight
+
+Now I will investigate the missing weight and height data:
+```{r}
+na_weight <- if_else(is.na(intake_participants$weight), 1, 0)
+na_height <- if_else(is.na(intake_participants$height), 1, 0)
+
+xtabs(~na_height + na_weight)
+```
+
+There is only one record where height is missing and weight isn't, 1840 are not missing, 137 records are missing both.
+```{r}
+#| label: na weight cross-tabs
+
+check_cols <- demographic_vars[!demographic_vars %in% c("height", "weight", "geo_area")]
+for (col in check_cols) {
+  cat("Cross-tab for", col, "and na_weight:\n")
+  form_string <- paste0("~ ", col, " + na_weight")
+  xtable <- xtabs(as.formula(form_string), data = intake_participants, addNA = TRUE)
+  na_pct <- round(prop.table(xtable, margin = 1)[, "1"] * 100, 1)
+  na_total_pct <- round(xtable[, "1"] / sum(xtable[, "1"]) * 100, 1)
+  print(cbind(xtable, pct_na = na_pct, tot_pct_na = na_total_pct))
+}
+```
+Now let's just get a general summary of height and weight:
+```{r}
+intake_participants |> select(height, weight) |> 
+  ggplot(aes(x = weight)) +
+  geom_boxplot()
+
+intake_participants |> select(height, weight) |> 
+  ggplot(aes(x = height)) +
+  geom_boxplot()
+```
+Let me look at all the outlying values from these columns:
+```{r}
+# IQR outlier method
+height_quartiles <- quantile(intake_participants$height, probs = c(.25, .5, .75), na.rm = TRUE)
+weight_quartiles <- quantile(intake_participants$weight, probs = c(.25, .5, .75), na.rm = TRUE)
+
+height_iqr <- IQR(intake_participants$height, na.rm = TRUE)
+weight_iqr <- IQR(intake_participants$weight, na.rm = TRUE)
+
+outlying_height_weight <- intake_participants |> 
+  filter(
+    height < (height_quartiles[1] - 1.5 * height_iqr) |
+    height > (height_quartiles[3] + 1.5 * height_iqr) |
+    weight < (weight_quartiles[1] - 1.5 * weight_iqr) |
+    weight > (weight_quartiles[3] + 1.5 * weight_iqr)
+  ) |>
+  select(pid, age, country, height, weight, edu_level, marital_status, employment)
+```
+
+
+I can try impute these, or simply leave them in the binary missingness indicator.
+The data is missing at an item-level - 
+
+```{r}
+missing_weight <- intake_participants |> filter(is.na(weight))
+
+missing_weight |> 
+  summarise(across(everything(), ~sum(is.na(.x)))) |> 
+  pivot_longer(everything(), names_to = "variable", values_to = "na_count") |> 
+  arrange(-na_count) |> 
+  mutate(pct_na = round(na_count / nrow(missing_weight), 2))
+```
+It appears that the weight variable has no real relation to any other variables' missingness.
+This indicates the data is missing at the item-level.
+This seems to be bordering between MAR and MNAR - people can be sensetive to disclosing their weight and height.
+
+Does gender affect weight's missingness:
+```{r}
+#| label: gender-weight-chisq
+
+# remove the 4 participants with missing gender
+clean_data <- subset(intake_participants, !is.na(gender))
+clean_data <- clean_data |> filter(gender != "Prefer not to say") # PNTS only has 3 groups
+weight_gender_table <- table(clean_data$gender, is.na(clean_data$weight), useNA = "ifany")
+chisq.test(weight_gender_table)
+weight_gender_table
+
+height_gender_table <- table(clean_data$gender, is.na(clean_data$height), useNA = "ifany")
+chisq.test(height_gender_table)
+height_gender_table
+```
+This confirms the weight data is MAR, highlighting nearly 16% of Non-binary participants are missing weight.
+
+I will find variables suitable to be used in multiple imputation (MICE):
+```{r}
+trialling_cols <- c("pid", "gender", "weight", "height", "age", "ethnicity", "country", "edu_level", "employment", "self_reported_weekly_play")
+complete_cases_df <- intake_participants %>%
+  filter(!is.na(weight) & !is.na(self_reported_weekly_play)) |>
+  mutate(across(c(gender, ethnicity, country, edu_level, employment), as.factor)) |> 
+  select(all_of(trialling_cols))
+
+# Fit a temporary diagnostic linear model
+vif_model <- lm(weight ~ gender + age + ethnicity + country + edu_level + employment + self_reported_weekly_play, 
+                data = complete_cases_df)
+
+# Check VIF scores
+vif(vif_model)
+```
+Features lack multi-collinearity.
+
+```{r}
+# pearson correlation for numeric
+correlation_data <- intake_participants |> select(age, self_reported_weekly_play, weight) |>
+  mutate(na_weight = is.na(weight))
+cor(correlation_data[, c("age", "self_reported_weekly_play", "na_weight")], use = "complete.obs", method = "pearson")
+
+# kruskal-wallis test for categoric
+for (col in c("country", "gender", "ethnicity", "employment", "edu_level", "marital_status")) {
+  # col_weight_formula <- as.formula(paste0("~weight+", col))
+  # print(addmargins(xtabs(col_weight_formula, data = intake_participants)))
+  print(kruskal.test(as.formula(paste0("weight~", col)), data = intake_participants))
+}
+```
+```{r}
+# kruskal-wallis test for categoric
+for (col in c("country", "gender", "ethnicity", "employment", "edu_level", "marital_status")) {
+  print(ggplot(intake_participants, aes(x = weight)) +
+    geom_histogram() +
+    facet_wrap(vars(.data[[col]])))
+}
+```
+
+I will perform multiple imputation with gender, ethnicity, employment, and marital status:
+
+```{r}
+#| label: weight-imputation
+
+# check collinearity
+impute_subset <- intake_participants |> 
+  select(
+    pid,
+    # targets
+    height, weight, 
+    # Core biological/demographic predictors
+    gender, age, ethnicity, 
+    # Geographical/Socioeconomic predictors
+    country, edu_level, employment,
+  ) |>
+  # Convert all textual categorical fields to factors (Required by MICE)
+  mutate(
+    # remove anomalies quickly - they will be imputed
+    weight = if_else(weight < 30, NA_real_, weight),
+    height = if_else(height > 400, NA_real_, height),
+    
+    across(where(is.character), as.factor)
+  )
+
+mice_config <- mice(impute_subset, maxit = 0)
+
+# which column was used for imputing the row feature
+pred_matrix <- mice_config$predictorMatrix
+
+# force height and weight to be the only features imputed
+no_impute_cols <- c("gender", "age", "ethnicity", "country", "edu_level", "employment")
+pred_matrix[no_impute_cols, ] <- 0
+pred_matrix["pid",] <- 0
+pred_matrix[, "pid"] <- 0
+
+# force non-impute cols to have no method
+mice_methods <- mice_config$method
+mice_methods[] <- ""
+mice_methods[c("height", "weight")] <- "pmm"
+
+# 'pmm' (Predictive Mean Matching) handles missing continuous variables seamlessly
+imputed_output <- mice(
+  data = impute_subset, 
+  m = 5, # 5 distinct imputed datasets
+  method = mice_methods,
+  predictorMatrix = pred_matrix,
+  seed = 30
+)
+
+map(c("height", "weight"), ~{
+  ggmice(imputed_output, aes(x = .imp, y = .data[[.x]])) +
+    geom_boxplot() +
+    labs(x = "Imputation number")
+}) |> 
+  wrap_plots()
+```
+```{r}
+print("Means of original data:")
+intake_participants |> select(height, weight) |> colMeans(na.rm = TRUE)
+
+print("Means of imputed data:")
+
+imputed_output |>
+  mice::complete("all", include = FALSE) |>
+  map(select, height, weight) |>
+  map(colMeans)
+```
+
+Now I will merge these with the dataset:
+```{r}
+imputed_df <- complete(imputed_output, 1)
+
+imputed_cols <- imputed_df |> 
+  select(pid, imputed_height = height, imputed_weight = weight)
+
+intake_participants <- intake_participants |> 
+  left_join(imputed_cols, by = "pid") |> 
+  mutate(
+    height = replace_na(imputed_height),
+    weight = replace_na(imputed_weight)
+  ) |> 
+  select(-imputed_weight, -imputed_height)
+
+summary(intake_participants)
+```
+
+## Exploring the demographics
+
+```{r}
+#| label: qualified-demographics
+
+# TODO: finish exploring care variables
+# qual_intake$care <- qual_intake |> case_when(
+#   !is.na(care_children) ~ "Yes",
+#   !is.na(care_elderly) ~ "Yes",
+#   !is.na(care_disability) ~ "Yes",
+#   !is.na(care_other) ~ ""
+# )
+
+demographic_vars <- c(
+  "country",
+  "geo_area",
+  "age",
+  "gender_clean",
+  "height",
+  "weight",
+  "ethnicity_clean",
+  "edu_level_clean",
+  "employment_clean",
+  "marital_status_clean",
+  "political_party_clean",
+  "dependents",
+  "neuro_diagnosed",
+  "neuro_identify"
+)
+```
+
+
+## Descriptive Statistics
+
+```{r}
+qual_intake |>
+  select(age, height, weight, gender_clean, ethnicity_clean, country, edu_level_clean) |>
+  tbl_summary(
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd}) [{min}, {max}]",
+      all_categorical() ~ "{n} / {N} ({p}%)"
+    ),
+    missing = "ifany"
+  ) |>
+  bold_labels() |>
+  modify_header(label = "**Variable**")
+```
+
+
+```{r}
+table(qual_intake$gender_clean, useNA = "ifany")
+table(qual_intake$ethnicity_clean, useNA = "ifany")
+table(qual_intake$political_party_clean, useNA = "ifany")
+table(qual_intake$edu_level_clean, useNA = "ifany")
+
+# barplot of gender and ADHD
+qual_intake |> count(gender_clean, is_adhd) |> mutate(prop = n / sum(n)) |>
+  ggplot(aes(x = gender_clean, y = prop, fill = is_adhd)) +
+  geom_col(position = "dodge") +
+  geom_text(
+    aes(label = n),
+    position = position_dodge(width = 0.9),
+    vjust = -0.5
+  ) +
+  labs(title = "Proportion of genders in qualified participants, coloured by ADHD indicator")
+
+# barplot of ethnicity and adhd (proportion of ethnicity)
+qual_intake |> count(ethnicity_clean, is_adhd) |> group_by(ethnicity_clean) |> mutate(prop = n / sum(n)) |>
+  ggplot(aes(x = ethnicity_clean, y = prop, fill = is_adhd)) +
+  geom_col(position = "dodge") +
+  geom_text(
+    aes(label = n),
+    position = position_dodge(width = 1),
+    hjust = -0.5
+  ) +
+  coord_flip() +
+  labs(title = "Proportion of ethnicities in qualified participants, by ADHD indicator", y = "% of ethnic group")
+
+# barplot of video games platforms played
+qual_intake_platforms <- qual_intake |>
+  select(pid, starts_with("plays")) |>
+  pivot_longer(
+    cols = starts_with("plays_"),
+    names_to = "platform",
+    values_to = "play"
+  ) |>
+  mutate(
+    play = as.integer(play),
+    platform = str_replace(platform, "plays_", "")
+  )
+
+# pairplot of age, height, weight coloured by gender
+qual_intake |> select(age, height, weight, gender_clean) |>
+  ggpairs(
+    aes(colour = gender_clean),
+    columns = c("age", "height", "weight")
+  )
+
+# distribution of age by gender
+ggplot(qual_intake, aes(x = age)) +
+  geom_histogram() +
+  facet_wrap(vars(gender_clean)) +
+  labs(
+    title = "Age distribution by gender",
+    x = "age",
+    y = "density",
+  )
+
+# distribution of platforms
+qual_intake_platforms |>
+  group_by(platform) |>
+  summarise(count = sum(play)) |>
+  ggplot(aes(x = fct_reorder(platform, count), y = count)) +
+  geom_col() +
+  labs(title = "Platform Frequency of qualified participants") +
+  coord_flip()
+
+# employment status (with ADHD)
+qual_intake |>
+  filter(!is.na(employment_clean)) |>
+  count(employment_clean, is_adhd) |>
+  mutate(employment_clean = fct_reorder(employment_clean, n)) |>
+  ggplot(aes(x = n, y = employment_clean, fill = is_adhd)) +
+  geom_col() +
+  labs(
+    x = "Count",
+    y = "Employment status",
+    title = "Employment status of qualified participants"
+  )
+
+# level of education
+qual_intake |>
+  count(edu_level_clean) |>
+  mutate(edu_level_clean = fct_reorder(edu_level_clean, n)) |>
+  ggplot(aes(y = edu_level_clean, x = n)) +
+  geom_col() +
+  labs(
+    title = "Highest level of education of qualified participants"
+  )
+
+# employment status with gender
+qual_intake |>
+  filter(!is.na(employment_clean)) |>
+  count(employment_clean, gender_clean) |>
+  mutate(employment_clean = fct_reorder(employment_clean, n)) |>
+  ggplot(aes(x = n, y = employment_clean)) +
+  geom_col() +
+  labs(
+    x = "Count",
+    y = "Employment status",
+    title = "Employment status of qualified participants"
+  ) +
+  facet_grid(rows = vars(gender_clean))
+
+# trends between platform and adhd
+qual_intake_platforms |>
+  left_join(qual_intake |> select(pid, gender_clean, is_adhd), by = join_by(pid)) |>
+  group_by(gender_clean, platform) |>
+  summarise(count = sum(play), prop = count / n()) |>
+  ggplot(aes(x = fct_reorder(platform, prop), y = prop)) +
+  geom_col(position = position_dodge()) +
+  facet_grid(rows = vars(fct_reorder(gender_clean, prop, .desc = TRUE))) +
+  labs(x = "platform", y = "% of gender", title = "Proportion of gender playing games on a platform") +
+  coord_flip()
+```
+
+We can see the following: a larger proportion of qualified women in the dataset have ADHD compared to men,
+a third of white participants have ADHD, a quarter of multiple ethnicities have ADHD, the Asian ethnic group had the smallest proportion of people with ADHD, steam is the most popular platform to play followed by Nintendo, nearly 50% of women played on their Nintendo device compared to roughly 30% of men.
+
+Additionally, most of the qualified participants are in their 20s, working full time or unemployed.
+
+## Neurodiverse Conditions
+
+This section explores the qualified participants' neurodiverse conditions:
+```{r}
+neuro_flag_vars <- c(
+  "is_neurotypical",
+  "is_adhd",
+  "is_dyscalculia",
+  "is_dyspraxia",
+  "is_ocd",
+  "is_prefer_not_say",
+  "is_specific_ld",
+  "is_neuro_diagnosed",
+  "is_asd",
+  "is_dyslexia",
+  "is_nvld",
+  "is_other",
+  "is_spd",
+  "is_tourette"
+)
+```
+
+
+## Platforms
+```{r}
+platform_flags <- c(
+  "plays_xbox",
+  "plays_steam",
+  "plays_nintendo",
+  "plays_ios",
+  "plays_android",
+  "plays_playstation"
+)
+```
+
+
+# Context & Goals
+
+Prof. Paul Cairns is really interested in any potential differences between people with ADHD and other players.
+There are also well-being measures including a measure for depression - it could be interesting to see to what extent how people play interacts with how well they are doing more generally. 
