@@ -1,0 +1,97 @@
+---
+title: "COVID-19 Mapper"
+format: html
+---
+
+This document attempts to recreate the work in the paper "Topological data analysis model for the spread of coronavirus" by Chen and volilc (2021).
+The aim of this paper is to understand and simplify the United States COVID-19 data cloud whilst preserving the underlying structure and features.
+
+First I need to clean and preprocess the data in accordance to their method:
+- days = number of days since 22/1/20 (british format)
+- select longitude, lattitude, cummulative confirmed cases, days since
+
+```{r}
+#| label: data-setup
+#| output: false
+
+library(dplyr)
+library(tidyr)
+library(lubridate)
+
+raw_data <- read.csv(here::here("data/covid_19_jhu/RAW_us_confirmed_cases.csv"))
+
+remove_cols <- c("Province_State", "Admin2", "UID", "iso2", "iso3", "code3", "FIPS", "Country_Region", "Combined_Key")
+
+start_date <- as.Date('22/1/20', format = "%d/%m/%y")
+end_date1 <- as.Date('19/6/20', format = "%d/%m/%y")
+end_date2 <- as.Date('24/7/20', format = "%d/%m/%y")
+
+# create long date format
+long_data <- raw_data |>
+    pivot_longer(
+        cols = starts_with("X"),
+        names_to = "date",
+        values_to = "cases"
+    ) |>
+    mutate(
+        date = gsub("^X", "", date),
+        date = gsub("\\.", "/", date),
+        date = mdy(date)
+    )
+
+# create days column
+long_data <- long_data |>
+    mutate(
+        days = as.integer(difftime(date, start_date, units = "days"))
+    )
+
+long_data_trimmed1 <- long_data |>
+    filter(date <= end_date1)
+
+long_data_trimmed2 <- long_data |>
+    filter(date <= end_date2)
+
+clean_data1 <- long_data_trimmed1[, c("Province_State", "Lat", "Long_", "cases", "days")] |>
+    rename(
+        state = Province_State,
+        latitude = Lat,
+        longitude = Long_
+    )
+
+# scale so the sum of the squared column values is 1 (L2 norm)
+# used when direction is more important than magnitude
+# outliers kept as this complements DBSCAN
+scaled_data1 <- clean_data1 |>
+    mutate(across(c(latitude, longitude, cases, days), function(col) {
+        norm_val <- sqrt(sum(col^2))
+        if (norm_val == 0) return(col) # stop division error
+        return(col / norm_val)
+    }))
+```
+
+Now we can try the Mapper algorithm used:
+* No filter function per se, just the identity mapping of the data
+* Euclidean distance metric
+* 10 intervals, 8% overlap
+* DBSCAN clustering
+
+There filter function is is just the identity map (a 4-dimensional function that is just the data points).
+With such few dimensions, and the fact they are exploring for statistical findings, there was no need to project the data.
+An 8% overlap was determined as it "empirically" appears to give the most informative Mapper graphs.
+DBSCAN was simply chosen
+
+The colours for the graphs are based on the data's order, which is by the geographical information, so nearby states are coloured similary.
+
+```{r}
+library(MapperAlgo)
+
+base_mapper_data <- scaled_data1[, !(names(scaled_data1) %in% c("state"))]
+base_mapper <- MapperAlgo(
+    base_mapper_data,
+    filter_values = base_mapper_data,
+    percent_overlap = 8,
+    intervals = 10,
+    methods = "dbscan",
+    method_params = list(eps = 0.5, minPts = 3) # same config as KeplerMapper
+)
+```
