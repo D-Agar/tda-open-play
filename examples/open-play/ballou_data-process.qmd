@@ -1,0 +1,694 @@
+---
+title: Clean raw data and save outputs
+---
+
+```{r}
+#| label: load-libraries
+
+library(data.table)
+library(dtplyr)
+library(fs)
+library(tidyverse)
+
+# Load custom functions
+source("R/helpers.R")
+```
+
+```{r}
+#| label: load-data-raw
+
+intake <- read_csv("data/raw/survey_intake_raw.csv.gz", guess_max = 34000)
+daily <- read_csv("data/raw/survey_daily_raw.csv.gz", guess_max = 10000)
+biweekly <- read_csv("data/raw/survey_biweekly_raw.csv.gz", guess_max = 5000)
+
+nintendo <- read_csv("data/raw/telemetry_nintendo_raw.csv.gz")
+steam <- read_csv("data/raw/telemetry_steam_raw.csv.gz")
+xbox <- read_csv("data/raw/telemetry_xbox_raw.csv.gz")
+ios <- read_csv("data/raw/telemetry_ios_raw.csv.gz")
+android <- read_csv("data/raw/telemetry_android_raw.csv.gz")
+timeuse <- read_csv("data/raw/timeuse_raw.csv.gz")
+
+dat_cog <- read_csv("data/raw/cognitive_tasks_raw.csv.gz")
+```
+
+## Preprocess Telemetry 
+
+```{r}
+#| label: preprocess-steam
+
+# non- and idle games lists are in helpers.R
+
+# First, create expanded dataset with scaling calculations for quality metrics
+steam_expanded_for_metrics <- steam |>
+  filter(!title_id %in% idle_games & !title_id %in% non_games) |>
+  mutate(
+    steam_id = as.character(steam_id),
+    pid = as.character(pid)
+  ) |>
+  arrange(pid, title_id, timestamp) |>
+  group_by(pid, steam_id) |>
+  mutate(
+    time_diff_hours = as.numeric(difftime(
+      timestamp,
+      lag(timestamp),
+      units = "hours"
+    )),
+    playtime_diff = playtime_forever - lag(playtime_forever)
+  ) |>
+  ungroup() |>
+  filter(
+    !is.na(playtime_diff),
+    playtime_diff >= 0,
+    !is.na(time_diff_hours),
+    time_diff_hours > 0
+  ) |>
+  mutate(
+    minutes_original = playtime_diff,
+    approximate_session_start = timestamp - minutes(playtime_diff),
+    approximate_session_end = timestamp,
+    datetime_hour_start = floor_date(approximate_session_start, "hour")
+  ) |>
+  group_by(pid, steam_id) |>
+  mutate(
+    time_since_last = as.numeric(difftime(
+      approximate_session_start,
+      lag(approximate_session_start),
+      units = "hours"
+    )),
+    is_new_session = ifelse(
+      is.na(time_since_last) | time_since_last > 1.5,
+      1,
+      0
+    ),
+    session_group_id = cumsum(is_new_session)
+  ) |>
+  filter(minutes_original > 0, minutes_original <= 480) |>
+  ungroup() |>
+  mutate(
+    h0_utc = floor_date(approximate_session_start, "hour"),
+    h1_utc = floor_date(approximate_session_end - seconds(1), "hour"),
+    n_hours = as.integer(difftime(h1_utc, h0_utc, units = "hours")) + 1
+  ) |>
+  tidyr::uncount(n_hours, .remove = FALSE, .id = "k") |>
+  mutate(
+    hour_start_utc = h0_utc + hours(k - 1),
+    hour_end_utc = hour_start_utc + hours(1),
+    minutes_in_hour = pmax(
+      0,
+      as.numeric(difftime(
+        pmin(approximate_session_end, hour_end_utc),
+        pmax(approximate_session_start, hour_start_utc),
+        units = "mins"
+      ))
+    )
+  ) |>
+  group_by(pid, hour_start_utc) |>
+  mutate(
+    hour_total = sum(minutes_in_hour),
+    scale_factor = if_else(hour_total > 60, 60 / hour_total, 1.0),
+    minutes_in_hour_corrected = minutes_in_hour * scale_factor
+  )
+
+# Continue processing to create steam_clean
+steam_clean <- steam_expanded_for_metrics |>
+  ungroup() |>
+  # Aggregate back to session level with corrected minutes
+  group_by(
+    pid,
+    steam_id,
+    session_group_id,
+    approximate_session_start,
+    approximate_session_end
+  ) |>
+  summarise(
+    minutes_original = first(minutes_original),
+    minutes = sum(minutes_in_hour_corrected),
+    datetime_hour_start = first(h0_utc),
+    timestamp = first(timestamp),
+    date = first(date),
+    hour = first(hour),
+    title_id = first(title_id),
+    playtime_forever = first(playtime_forever),
+    playtime_2weeks = first(playtime_2weeks),
+    game_ref = first(game_ref),
+    .groups = "drop"
+  ) |>
+  # Calculate corrected session end time based on corrected minutes
+  mutate(
+    approximate_session_end_original = approximate_session_end,
+    approximate_session_end = approximate_session_start + seconds(minutes * 60)
+  ) |>
+  # Remove session_group_id (only used for intermediate calculations)
+  select(-session_group_id)
+
+```
+
+```{r}
+#| label: steam-quality-metrics
+
+# Calculate Steam data quality metrics using the intermediate expanded data
+steam_quality_metrics <- steam_expanded_for_metrics |>
+  ungroup() |>
+  mutate(
+    minutes_reduced = minutes_in_hour - minutes_in_hour_corrected,
+    was_scaled = scale_factor < 1.0
+  ) |>
+  summarise(
+    # Metric 1: Player-hour combinations
+    total_player_hours = n_distinct(pid, hour_start_utc),
+    hours_exceeding_60 = n_distinct(
+      pid[hour_total > 60],
+      hour_start_utc[hour_total > 60]
+    ),
+
+    # Metric 2: Hour segments
+    total_segments = n(),
+    segments_scaled = sum(was_scaled),
+
+    # Metric 3: Minutes reduced (only for scaled segments)
+    mean_minutes_reduced = mean(minutes_reduced[was_scaled], na.rm = TRUE),
+    median_minutes_reduced = median(minutes_reduced[was_scaled], na.rm = TRUE),
+
+    # Calculate proportions
+    prop_hours_exceeding = hours_exceeding_60 / total_player_hours,
+    prop_segments_scaled = segments_scaled / total_segments
+  )
+
+# Save metrics for use in index.qmd
+write_csv(steam_quality_metrics, "data/qc/steam_quality_metrics.csv")
+
+# Clean up temporary variable
+rm(steam_expanded_for_metrics)
+
+```
+
+```{r}
+#| label: preprocess-xbox
+
+# Clean Xbox data and keep only active gaming sessions
+# In particular, Xbox has a handful of overlapping sessions, potentially a result of
+# multi-device use or
+# that we need to resolve:
+# - at most one title at any instant
+# - handoff tolerance 'tol_sec' (short overlaps => later-starting title wins)
+# - ≥3 concurrent titles => drop that slice
+
+xbox_clean <- xbox |>
+  arrange(pid, session_start, session_end) |>
+  merge_adjacent_sessions(tol_sec = dseconds(60)) |>
+
+  # filter non-foreground games
+  filter(
+    duration >= 1,
+    title_placement == "Full", # in foreground
+    !genres %in% c("Shopping", "Video", "Entertainment", "Utilities & tools"),
+    tolower(title_id) != "e1924c10-9c91-4652-81b9-8ca0670e77a7" # home screen
+  ) |>
+
+  # filter suspicious sessions
+  filter(
+    duration <= 480,
+    !is.na(session_start),
+    !is.na(session_end),
+    session_end > session_start,
+  ) |>
+  resolve_overlaps() |>
+  arrange(pid, session_start, session_end)
+
+```
+
+```{r}
+#| label: preprocess-nintendo
+
+tol <- dseconds(60)
+
+nintendo_clean <- nintendo |>
+
+  # filter duplicate rows and merge adjacent sessions
+  distinct() |>
+  filter(duration >= 1, pid %in% intake$pid) |>
+  merge_adjacent_sessions(tol_sec = tol) |>
+
+  # filter suspicious sessions
+  filter(
+    duration <= 480,
+    !is.na(session_start),
+    !is.na(session_end),
+    session_end > session_start,
+    session_start < time_of_pull
+  ) |>
+
+  # clean up
+  arrange(pid, title_id, session_start, session_end) |>
+  select(
+    pid,
+    title_id,
+    session_start,
+    session_end,
+    duration,
+    device_type,
+    operation_mode
+  ) |>
+  as_tibble()
+
+```
+
+```{r}
+#| label: preprocess-android
+
+android <- android |>
+  mutate(platform = "Android") |>
+  select(pid, platform, day_local = date, minutes = total_gaming_minutes)
+
+```
+
+```{r}
+#| label: preprocess-ios
+
+ios <- ios |>
+  mutate(platform = "iOS") |>
+  select(pid, platform, day_local = date, minutes = total_gaming_minutes)
+
+```
+
+As preregistered, we exclude days where total gaming time (across all platforms) exceeds 16 hours, as well as sessions that are more than 8 hours long or whose end time precedes their start time. The exclusions are applied to all relevant datasets.
+
+```{r}
+#| label: apply-telemetry-exclusions
+
+# --- Build tz map with country and timezone for DST-aware conversion --------
+tz_map <- intake |>
+  mutate(
+    pid = as.character(pid),
+    country,
+    local_timezone,
+    .keep = "none"
+  ) |>
+  distinct(pid, .keep_all = TRUE)
+
+# --- Hourly from sessions (Nintendo + Xbox) ---------------------------------
+# Join with timezone map and calculate DST-aware offsets
+# Note: start_local/end_local have UTC labels but local time VALUES (for hour extraction)
+sessions_telemetry <- bind_rows(
+  xbox_clean |> mutate(platform = "Xbox"),
+  nintendo_clean |> mutate(platform = "Nintendo")
+) |>
+  mutate(pid = as.character(pid)) |>
+  left_join(tz_map, by = "pid") |>
+  filter(!is.na(local_timezone)) |>
+  mutate(
+    # Calculate DST-aware offset for each timestamp
+    offset_start = get_dst_offset(session_start, country, local_timezone),
+    offset_end = get_dst_offset(session_end, country, local_timezone),
+    # Add offset to get local time values (keeping UTC label for compatibility)
+    start_local = session_start + offset_start,
+    end_local = session_end + offset_end,
+    duration_min = as.numeric(difftime(
+      session_end,
+      session_start,
+      units = "mins"
+    ))
+  ) |>
+  filter(
+    !is.na(session_start),
+    !is.na(session_end),
+    session_end > session_start,
+    duration_min >= 1
+  )
+
+hourly_from_sessions <- sessions_telemetry |>
+  filter(!is.na(start_local), !is.na(end_local)) |>
+  mutate(
+    h0_local = floor_date(start_local, "hour"),
+    h1_local = floor_date(end_local - seconds(1), "hour"),
+    n_hours = as.integer(difftime(h1_local, h0_local, units = "hours")) + 1
+  ) |>
+  filter(!is.na(n_hours), n_hours > 0) |>
+  tidyr::uncount(n_hours, .remove = FALSE, .id = "k") |>
+  mutate(
+    hour_start_local = h0_local + hours(k - 1),
+    minutes = pmax(
+      0,
+      as.numeric(difftime(
+        pmin(end_local, hour_start_local + hours(1)),
+        pmax(start_local, hour_start_local),
+        units = "mins"
+      ))
+    ),
+    # Convert back to UTC (this preserves the instant, just changes label)
+    hour_start_utc = with_tz(hour_start_local, tzone = "UTC")
+  ) |>
+  select(pid, platform, hour_start_local, hour_start_utc, minutes)
+
+# --- Hourly from Steam (already hourly) -------------------------------------
+hourly_from_steam <- steam_clean |>
+  select(pid, datetime_hour_start, minutes) |>
+  mutate(pid = as.character(pid)) |>
+  left_join(tz_map, by = "pid") |>
+  filter(!is.na(local_timezone)) |>
+  mutate(
+    platform = "Steam",
+    hour_start_utc = datetime_hour_start,
+    # Calculate DST-aware offset and add to get local time values
+    offset = get_dst_offset(datetime_hour_start, country, local_timezone),
+    hour_start_local = datetime_hour_start + offset
+  ) |>
+  select(pid, platform, hour_start_local, hour_start_utc, minutes)
+
+hourly_telemetry <- bind_rows(hourly_from_sessions, hourly_from_steam)
+
+# --- Daily totals (local day) incl. iOS/Android ------------------------------
+daily_telemetry <- hourly_telemetry |>
+  mutate(day_local = as.Date(hour_start_local)) |>
+  group_by(pid, platform, day_local) |>
+  summarise(minutes = sum(minutes, na.rm = TRUE), .groups = "drop")
+
+daily_ios_android <- bind_rows(
+  ios |>
+    transmute(
+      pid = as.character(pid),
+      platform = "iOS",
+      day_local = as.Date(day_local),
+      minutes
+    ),
+  android |>
+    transmute(
+      pid = as.character(pid),
+      platform = "Android",
+      day_local = as.Date(day_local),
+      minutes
+    )
+)
+
+daily_all <- bind_rows(daily_telemetry, daily_ios_android) |>
+  group_by(pid, day_local) |>
+  summarise(total_minutes = sum(minutes, na.rm = TRUE), .groups = "drop")
+
+exclusion_days <- daily_all |>
+  filter(total_minutes > 16 * 60) |>
+  select(pid, day_local)
+
+# --- Apply exclusions back to each dataset ----------------------------------
+steam_clean <- steam_clean |>
+  left_join(tz_map, by = c("pid" = "pid")) |>
+  filter(!is.na(local_timezone)) |>
+  mutate(
+    offset = get_dst_offset(datetime_hour_start, country, local_timezone),
+    day_local = as.Date(datetime_hour_start + offset)
+  ) |>
+  anti_join(exclusion_days, by = c("pid", "day_local")) |>
+  select(-country, -local_timezone, -offset, -day_local)
+
+xbox_clean <- xbox_clean |>
+  left_join(tz_map, by = "pid") |>
+  filter(!is.na(local_timezone)) |>
+  mutate(
+    offset = get_dst_offset(session_start, country, local_timezone),
+    day_local = as.Date(session_start + offset)
+  ) |>
+  anti_join(exclusion_days, by = c("pid", "day_local")) |>
+  select(-country, -local_timezone, -offset, -day_local)
+
+nintendo_clean <- nintendo_clean |>
+  left_join(tz_map, by = "pid") |>
+  filter(!is.na(local_timezone)) |>
+  mutate(
+    offset = get_dst_offset(session_start, country, local_timezone),
+    day_local = as.Date(session_start + offset)
+  ) |>
+  anti_join(exclusion_days, by = c("pid", "day_local")) |>
+  select(-country, -local_timezone, -offset, -day_local)
+
+ios <- ios |>
+  mutate(pid = as.character(pid), day_local = as.Date(day_local)) |>
+  anti_join(exclusion_days, by = c("pid", "day_local"))
+
+android <- android |>
+  mutate(pid = as.character(pid), day_local = as.Date(day_local)) |>
+  anti_join(exclusion_days, by = c("pid", "day_local"))
+
+```
+
+## Preprocess Survey Data
+
+```{r}
+#| label: preprocess-intake-survey
+
+intake_clean <- intake |>
+
+  # self-reported playtime over 50 hours per week is treated as NA
+  mutate(
+    self_reported_weekly_play = if_else(
+      self_reported_weekly_play > 50 * 60,
+      NA,
+      self_reported_weekly_play
+    )
+  ) |>
+
+  # linked platforms are exported only as console ("core") platforms - update to include whether people linked iOS as well
+  rowwise() |>
+  mutate(
+    linked_platforms = {
+      v <- unique(trimws(strsplit(coalesce(linked_platforms, ""), ",")[[1]]))
+      v <- v[v != ""]
+      if (pid %in% ios$pid) {
+        v <- union(v, "iOS")
+      }
+      if (pid %in% android$pid) {
+        v <- union(v, "Android")
+      }
+      na_if(paste(v, collapse = ", "), "")
+    }
+  ) |>
+  ungroup()
+
+```
+
+In both the daily and biweekly surveys, we have cases of (1) duplicate survey entries within a single day, such that only the first should be considered, (2) participants with errors in the recorded "wave" coding which should be recoded based on their start date, and (3) "false starts" that should be ignored in favor of a later start date and contiguous surveys from Day 1 to 30. We handle each of those cases here. 
+
+```{r}
+#| label: preprocess-daily-survey
+
+daily_clean <- daily |>
+  filter(!bpnsfs_failed_att_check) |>
+  mutate(baseline_day = as.Date(date) - if_else(hour(date) < 4, 1L, 0L)) %>%
+  {
+    base <- .
+
+    best <- base |>
+      distinct(pid, ideal_baseline_day = baseline_day) |> # candidates = observed days only
+      inner_join(
+        base |> select(pid, baseline_day, date),
+        by = "pid",
+        relationship = "many-to-many"
+      ) |>
+      mutate(dw = 1L + as.integer(baseline_day - ideal_baseline_day)) |>
+      filter(dplyr::between(dw, 1L, 30L)) |>
+      group_by(pid, ideal_baseline_day, dw) |>
+      slice_min(date, n = 1, with_ties = FALSE) |> # one per (pid, candidate, wave)
+      ungroup() |>
+      count(pid, ideal_baseline_day, name = "n_valid") |>
+      group_by(pid) |>
+      arrange(desc(n_valid), ideal_baseline_day) |>
+      slice(1) |>
+      ungroup()
+
+    base |>
+      left_join(best, by = "pid") |>
+      mutate(
+        original_wave = wave,
+        wave = 1L + as.integer(baseline_day - ideal_baseline_day)
+      ) |>
+      filter(dplyr::between(wave, 1L, 30L)) |>
+      group_by(pid, wave) |>
+      slice_min(date, n = 1, with_ties = FALSE) |>
+      ungroup()
+  }
+
+ideal <- daily_clean |>
+  distinct(pid, ideal_baseline_day)
+
+dropped <- daily |>
+  mutate(baseline_day = as.Date(date) - if_else(hour(date) < 4, 1L, 0L)) |>
+  anti_join(daily_clean |> select(pid, date), by = c("pid", "date")) |>
+  left_join(ideal, by = "pid") |>
+  mutate(
+    derived_wave = if_else(
+      !is.na(ideal_baseline_day),
+      1L + as.integer(baseline_day - ideal_baseline_day),
+      NA_integer_
+    ),
+    drop_reason = case_when(
+      is.na(ideal_baseline_day) ~ "no ideal baseline (check pid)",
+      !dplyr::between(
+        derived_wave,
+        1L,
+        30L
+      ) ~ "outside 1..30 after reassignment",
+      TRUE ~ "duplicate within (pid, wave) — later submission dropped"
+    )
+  ) |>
+  arrange(pid, date) |>
+  select(pid, date, baseline_day, ideal_baseline_day, derived_wave, drop_reason)
+
+```
+
+```{r}
+#| label: preprocess-biweekly-survey
+
+biweekly_clean <- biweekly |>
+  filter(!bangs_failed_att_check) |>
+  mutate(baseline_day = as.Date(date) - if_else(hour(date) < 4, 1L, 0L)) %>%
+  {
+    base <- .
+
+    # candidates = observed days only; score by count of valid panel waves (1..30) within ±7d of 14d grid
+    best <- base |>
+      distinct(pid, ideal_baseline_day = baseline_day) |>
+      inner_join(
+        base |> select(pid, baseline_day, date),
+        by = "pid",
+        relationship = "many-to-many"
+      ) |>
+      mutate(
+        delta_days = as.integer(baseline_day - ideal_baseline_day),
+        dpw = 1L + as.integer(round(delta_days / 14)) # derived panel wave (nearest 14d)
+      ) |>
+      filter(
+        dplyr::between(dpw, 1L, 30L),
+        abs(delta_days - 14L * (dpw - 1L)) <= 7L # within ±7 days of 14d grid
+      ) |>
+      group_by(pid, ideal_baseline_day, dpw) |>
+      slice_min(date, n = 1, with_ties = FALSE) |>
+      ungroup() |>
+      count(pid, ideal_baseline_day, name = "n_valid") |>
+      group_by(pid) |>
+      arrange(desc(n_valid), ideal_baseline_day) |>
+      slice(1) |>
+      ungroup()
+
+    base |>
+      left_join(best, by = "pid") |>
+      mutate(
+        original_wave = wave,
+        delta_days_final = as.integer(baseline_day - ideal_baseline_day),
+        derived_wave = 1L + as.integer(round(delta_days_final / 14)),
+        wave = derived_wave
+      ) |>
+      filter(
+        dplyr::between(wave, 1L, 30L),
+        abs(delta_days_final - 14L * (wave - 1L)) <= 7L # enforce validity post-assign
+      ) |>
+      group_by(pid, wave) |>
+      slice_min(date, n = 1, with_ties = FALSE) |>
+      ungroup() |>
+      select(
+        ideal_baseline_day,
+        baseline_day,
+        date,
+        original_wave,
+        derived_wave,
+        wave,
+        everything()
+      )
+  }
+
+```
+
+```{r}
+#| label: preprocess-timeuse
+# Assign quality flags to daily time use diaries
+
+# Calculate duration and flags
+timeuse_flags <- timeuse |>
+  mutate(
+    # Use already-parsed POSIXct columns directly (read_csv handles ISO 8601)
+    # Duration of each individual activity
+    duration_min = as.numeric(difftime(end_time, start_time, units = "mins"))
+  ) |>
+  group_by(pid, daily_wave) |>
+  summarise(
+    n_activities = n(),
+    # Sum of all activity durations in this daily_wave
+    total_minutes = sum(duration_min, na.rm = TRUE),
+    has_sleep = any(str_to_lower(activity) == "sleep", na.rm = TRUE),
+    has_personal_care = any(
+      str_to_lower(activity) == "personal care",
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) |>
+  mutate(
+    quality_flag = case_when(
+      !has_sleep &
+        !has_personal_care ~ "Low quality: no sleep and no personal care",
+      !has_sleep ~ "Low quality: no sleep",
+      !has_personal_care ~ "Low quality: no personal care",
+      total_minutes < 1350 ~ "Low quality: >90 minutes unaccounted for", # 1440 - 90 = 1350
+      n_activities < 5 ~ "Low quality: fewer than 5 activities logged",
+      TRUE ~ "Good quality"
+    )
+  ) |>
+  select(pid, daily_wave, quality_flag)
+
+# Add flags to dataset
+timeuse_clean <- timeuse |>
+  left_join(timeuse_flags, by = c("pid", "daily_wave")) |>
+  arrange(pid, daily_wave, start_time)
+
+```
+
+
+```{r}
+#| label: preprocess-simon
+
+# Only include non-pilot-study participants who qualified at intake
+dat_cog <- dat_cog |>
+  filter(
+    pid %in%
+      unique(intake$pid[intake$qualified & intake$cohort != "Platform Pilot"]),
+    wave %in% c(1, 3, 5) # only waves with cognitive data
+  )
+
+# Take relevant variables and observations only
+# `score_final` is automatically added to all rows so distinct works here
+dat_cog <- dat_cog |>
+  filter(practice == 0, task == "simon") |>
+  add_count(pid, wave, name = "n_trials") |>
+  distinct(
+    pid,
+    wave,
+    datetime,
+    device_type,
+    n_trials,
+    score_final,
+    meanrt_final
+  )
+
+dat_cog <- dat_cog |>
+  mutate(wave = factor(wave)) |>
+  arrange(wave, pid)
+```
+
+
+## Write clean data files
+
+```{r}
+#| label: write-clean-files
+
+# Construct path and directory
+path_out <- path("data", "clean")
+dir_create(path_out)
+
+# Write files
+write_csv(intake_clean, path(path_out, "survey_intake", ext = "csv.gz"))
+write_csv(daily_clean, path(path_out, "survey_daily", ext = "csv.gz"))
+write_csv(biweekly_clean, path(path_out, "survey_biweekly", ext = "csv.gz"))
+write_csv(nintendo_clean, path(path_out, "nintendo", ext = "csv.gz"))
+write_csv(steam_clean, path(path_out, "steam", ext = "csv.gz"))
+write_csv(xbox_clean, path(path_out, "xbox", ext = "csv.gz"))
+write_csv(ios, path(path_out, "ios", ext = "csv.gz"))
+write_csv(android, path(path_out, "android", ext = "csv.gz"))
+write_csv(timeuse_clean, path(path_out, "timeuse", ext = "csv.gz"))
+write_csv(dat_cog, path(path_out, "simon", ext = "csv.gz"))
+```

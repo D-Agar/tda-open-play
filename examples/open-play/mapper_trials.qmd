@@ -1,0 +1,10 @@
+---
+title: "Utilising Mapper with Open Play"
+author:
+  name: Daniel Agar
+format:
+  pdf: default
+  html:
+    toc: true
+  docx: default
+---

@@ -1,7 +1,1530 @@
 ---
 title: "Describing and Understanding Open Play: Post-cleaning"
-format: html
+author:
+  name: Daniel Agar
+format:
+  pdf: default
+  html:
+    toc: true
+  docx: default
 ---
+
+```{r}
+#| label: libraries
+#| include: false
+#| code-summary: "Show code (Load required R packages)"
+library(tidyverse)
+library(data.table)
+library(dtplyr)
+library(gtsummary)
+library(skimr)
+library(patchwork)
+library(boot)
+library(corrplot)
+library(stringr)
+library(rstatix)
+
+theme_set(theme_minimal())
+source("examples/open-play/helpers.R")
+```
+
+```{r}
+#| label: data setup
+#| include: false
+#| cache: true
+#| output: false
+
+android <- read_csv("data/open-play/clean/android.csv.gz")
+metadata <- read_csv("data/open-play/clean/game_metadata.csv.gz")
+ios <- read_csv("data/open-play/clean/ios.csv.gz")
+nintendo <- read_csv("data/open-play/clean/nintendo.csv.gz")
+simon <- read_csv("data/open-play/clean/simon.csv.gz")
+steam <- read_csv("data/open-play/clean/steam.csv.gz")
+steam_visibility <- read_csv(
+  "data/open-play/raw/telemetry_steam_account_linking_raw.csv.gz"
+)
+biweekly <- read_csv("data/open-play/clean/biweekly.csv.gz")
+daily <- read_csv("data/open-play/clean/daily.csv.gz", guess_max = 10000)
+intake <- read_csv("data/open-play/clean/intake.csv.gz", guess_max = 34000)
+time_use <- read_csv("data/open-play/clean/timeuse.csv.gz") |>
+  filter(quality_flag == "Good quality")
+xbox <- read_csv("data/open-play/clean/xbox.csv.gz")
+
+xbox_raw <- read_csv("data/open-play/raw/telemetry_xbox_raw.csv.gz")
+nintendo_raw <- read_csv("data/open-play/raw/telemetry_nintendo_raw.csv.gz")
+daily_raw <- read_csv("data/open-play/raw/survey_daily_raw.csv.gz")
+biweekly_raw <- read_csv(
+  "data/open-play/raw/survey_biweekly_raw.csv.gz", guess_max = 5000
+)
+time_use_raw <- read_csv("data/open-play/raw/timeuse_raw.csv.gz")
+
+intake_participants <- read_csv(
+  "data/open-play/clean/intake_participant.csv.gz"
+)
+```
+
+```{r}
+#| label: data prep
+#| cache: true
+#| include: false
+
+# clean most likely to use columns
+steam_visibility <- steam_visibility |>
+  filter(platform == "steam") |>
+  mutate(
+    timestamp = as_datetime(timestamp, tz = "UTC"),
+    is_public = event == "steamDataPublic"
+  ) |>
+  select(pid, timestamp, event, is_public)
+
+# import raw data for calculating how many rows were excluded
+xbox_valid_sessions <- xbox_raw |>
+  merge_adjacent_sessions(tol_sec = 60) |>
+  # filter non-foreground games
+  filter(
+    duration >= 1,
+    pid %in% intake$pid,
+    title_placement == "Full", # in foreground
+    !genres %in% c("Shopping", "Video", "Entertainment", "Utilities & tools"),
+    tolower(title_id) != "e1924c10-9c91-4652-81b9-8ca0670e77a7" # home screen
+  )
+
+nintendo_valid_sessions <- nintendo_raw |>
+  distinct() |>
+  filter(
+    pid %in% intake$pid,
+    duration >= 1
+  ) |>
+  merge_adjacent_sessions(tol_sec = 60)
+
+# merge with the local time zone offsets from intake
+# Note: We keep country and local_timezone for DST-aware conversion
+tz_map <- intake |>
+  mutate(
+    pid,
+    country,
+    local_timezone,
+    .keep = "none"
+  ) |>
+  distinct(pid, .keep_all = TRUE)
+
+# aggregate data at each level of granularity (session, hourly, daily)
+# session level (Nintendo and Xbox)
+session_telemetry <- bind_rows(
+  xbox |> mutate(platform = "Xbox"),
+  nintendo |> mutate(platform = "Nintendo")
+) |>
+  left_join(tz_map, by = "pid") |>
+  filter(!is.na(local_timezone)) |>
+  mutate(
+    # Calculate DST-aware offset for each timestamp
+    offset_start = get_dst_offset(session_start, country, local_timezone),
+    offset_end = get_dst_offset(session_end, country, local_timezone),
+    # Add offset to get local time values (keeping UTC label for compatibility)
+    start_local = session_start + offset_start,
+    end_local = session_end + offset_end,
+    duration_min = as.numeric(difftime(
+      session_end,
+      session_start,
+      units = "mins"
+    ))
+  ) |>
+  filter(
+    !is.na(session_start),
+    !is.na(session_end),
+    session_end > session_start,
+    duration_min >= 1
+  )
+
+# Hourly (Nintendo and Xbox)
+# expand sessions into local-hour bins
+# compute overlap minutes, and add UTC hour
+hourly_from_sessions <- session_telemetry |>
+  filter(!is.na(start_local), !is.na(end_local)) |>
+  mutate(
+    h0_local = floor_date(start_local, "hour"),
+    h1_local = floor_date(end_local - seconds(1), "hour"),
+    n_hours = as.integer(difftime(h1_local, h0_local, units = "hours")) + 1
+  ) |>
+  filter(!is.na(n_hours), n_hours > 0) |>
+  tidyr::uncount(n_hours, .remove = FALSE, .id = "k") |>
+  mutate(
+    hour_start_local = h0_local + hours(k - 1),
+    minutes = pmax(
+      0,
+      as.numeric(difftime(
+        pmin(end_local, hour_start_local + hours(1)),
+        pmax(start_local, hour_start_local),
+        units = "mins"
+      ))
+    ),
+    # Convert back to UTC (this preserves the instant, just changes label)
+    hour_start_utc = with_tz(hour_start_local, tzone = "UTC")
+  ) |>
+  select(pid, platform, title_id, hour_start_local, hour_start_utc, minutes) |>
+  group_by(pid, platform, title_id, hour_start_local, hour_start_utc) |>
+  summarise(minutes = sum(minutes, na.rm = TRUE), .groups = "drop")
+
+hourly_from_steam <- steam |>
+  mutate(
+    datetime_hour_start = ymd_hms(
+      paste0(date, " ", sprintf("%02d", hour), ":00:00"),
+      tz = "UTC"
+    )
+  ) |>
+  select(pid, title_id, datetime_hour_start, minutes) |>
+  left_join(tz_map, by = "pid") |>
+  filter(!is.na(local_timezone)) |>
+  mutate(
+    platform = "Steam",
+    hour_start_utc = datetime_hour_start,
+    offset = get_dst_offset(datetime_hour_start, country, local_timezone),
+    # these are local time values with UTC labels due to R's POSIXct limitation
+    hour_start_local = datetime_hour_start + offset
+  ) |>
+  select(pid, platform, title_id, hour_start_local, hour_start_utc, minutes) |>
+  group_by(pid, platform, title_id, hour_start_local, hour_start_utc) |>
+  summarise(minutes = sum(minutes, na.rm = TRUE), .groups = "drop")
+
+hourly_telemetry <- bind_rows(hourly_from_sessions, hourly_from_steam)
+
+# Daily (Nintendo + Xbox + Steam; collapse hourly to days)
+daily_telemetry <- hourly_telemetry |>
+  mutate(
+    day_local = as.Date(hour_start_local),
+  ) |>
+  group_by(pid, platform, day_local) |>
+  summarise(minutes = sum(minutes, na.rm = TRUE), .groups = "drop") |>
+  bind_rows(ios) |>
+  bind_rows(android)
+
+# Weekly
+weekly_all <- daily_telemetry |>
+  mutate(
+    week = floor_date(day_local, "week")
+  ) |>
+  group_by(pid, platform, week) |>
+  summarise(minutes = sum(minutes, na.rm = TRUE), .groups = "drop")
+
+telemetry_spans <- daily_telemetry |>
+  group_by(pid, platform) |>
+  summarise(
+    telemetry_start = min(day_local, na.rm = TRUE),
+    # end of last hour bin
+    telemetry_end = max(day_local, na.rm = TRUE) + hours(1),
+    week = floor_date(telemetry_end, "week"),
+    n_weeks = as.integer(difftime(
+      telemetry_end,
+      telemetry_start,
+      units = "weeks"
+    )) +
+      1,
+    .groups = "drop"
+  )
+```
+
+# Context
 
 This follows on from `cleaning.qmd`, where I focused on understanding the participants and the general demographics of the participants.
 Here, I begin to understand the data, gaining more deeper insights and exploring the telemetry data of the qualified participants.
+
+Prof. Paul Cairns is really interested in any potential differences between people with ADHD and other players.
+There are also well-being measures including a measure for depression - it could be interesting to see to what extent how people play interacts with how well they are doing more generally.
+
+# Demographics
+
+First, I will get the general demographic descriptive statistics for the participants.
+```{r}
+# create ADHD flag
+intake_participants <- intake_participants |> 
+  mutate(
+    adhd = case_when(
+      !is.na(neuro_diag_adhd) ~ "Diagnosed ADHD",
+      is.na(neuro_diag_adhd) & !is.na(neuro_iden_adhd) ~ "Self-Identified ADHD",
+      TRUE ~ "Neurotypical"
+    )
+  )
+
+demographic_vars <- c(
+  "pid",
+  "country",
+  "geo_area",
+  "gender",
+  "height",
+  "weight",
+  "age",
+  "ethnicity",
+  "edu_level",
+  "employment",
+  "political_party",
+  "marital_status",
+  "adhd"
+)
+
+participants_pid <- unique(intake_participants$pid)
+
+intake_participants |>
+  select(all_of(setdiff(demographic_vars, c("pid", "geo_area")))) |>
+  mutate(across(where(is.character), as.factor)) |> 
+  skim() |> print()
+```
+
+
+```{r}
+# height and weight by age, gender, country
+mean_values <- intake_participants |>
+  group_by(country, gender, adhd) |>
+  summarise(
+    n_people = n(),
+    height_mean = mean(height),
+    weight_mean = mean(weight),
+    age_mean = mean(age),
+    .groups = "drop_last"
+  )
+mean_values
+```
+
+```{r}
+# cross-tabs for adhd
+adhd_demographic_xtab <- intake_participants |>
+  count(adhd, gender, ethnicity, country)
+```
+
+```{r}
+plot_data <- intake_participants |> 
+  mutate(adhd = as.factor(adhd))
+
+adhd_demographic_summary <- plot_data |>
+  select(adhd, age, height, weight) |>
+  by(~adhd, summary)
+adhd_demographic_summary
+
+age_box <- ggplot(intake_participants, aes(y = age, fill = country)) +
+  geom_boxplot()
+height_box <- ggplot(intake_participants, aes(y = height, fill = country)) +
+  geom_boxplot()
+weight_box <- ggplot(intake_participants, aes(y = weight, fill = country)) +
+  geom_boxplot()
+
+age_box + height_box + weight_box + plot_layout(guides = "collect")
+```
+
+
+A quick check of height, controlling for ADHD, gender, and country.
+```{r}
+# distribution of height by country and adhd
+ggplot(intake_participants, aes(x = height, fill = country)) +
+  geom_histogram(bins = 25, alpha = 0.5) +
+  facet_wrap(
+    vars(
+      factor(gender, levels = c("Man", "Woman", "Non-binary", "Prefer not to say", "NA")),
+      adhd
+    ),
+    # scales = "free_y"
+  ) +
+  geom_vline(data = mean_values, aes(xintercept = height_mean, colour = country)) +
+  labs(
+    x = "Height",
+    y = "Count",
+    fill = "Country",
+    colour = "Mean",
+    title = "Distribution of height by gender, ADHD, and country"
+  )
+```
+
+Now examining the distributions of weight:
+```{r}
+# weight by country and adhd
+ggplot(plot_data, aes(x = weight, fill = country)) +
+  geom_histogram(bins = 25, alpha = 0.5) +
+  facet_wrap(
+    vars(
+      factor(gender, levels = c("Man", "Woman", "Non-binary", "Prefer not to say", "NA")),
+      adhd
+    ),
+    # scales = "free_y"
+  ) +
+  geom_vline(data = mean_values, aes(xintercept = weight_mean, colour = country)) +
+  labs(
+    x = "Weight",
+    y = "Count",
+    fill = "Country",
+    colour = "Mean",
+    title = "Distribution of weight by gender, ADHD, and country"
+  )
+```
+
+```{r}
+# distribution of age by gender, adhd, country
+ggplot(plot_data, aes(x = age, fill = country)) +
+  geom_histogram(bins = 23, alpha = 0.5) +
+  facet_wrap(
+    vars(
+      factor(gender, levels = c("Man", "Woman", "Non-binary", "Prefer not to say", "NA")),
+      adhd
+    ),
+    # scales = "free_y"
+  ) +
+  geom_vline(data = mean_values, aes(xintercept = age_mean, colour = country)) +
+  labs(
+    x = "Age",
+    y = "Count",
+    fill = "Country",
+    colour = "Mean",
+    title = "Distribution of age by gender, ADHD, and country"
+  )
+```
+
+Now to get more of an idea of the distributions of ADHD categories:
+```{r}
+# plot distributions with adhd
+adhd_age_density <- ggplot(plot_data, aes(x = age, fill = adhd)) +
+  geom_density(alpha = 0.5, show.legend = TRUE) +
+  labs(fill = "ADHD Status") +
+  guides(fill = "none")
+
+adhd_age_hist <- ggplot(plot_data, aes(x = age, fill = adhd)) +
+  geom_histogram(position = "identity", bins = 20, alpha = 0.5, show.legend = TRUE) +
+  labs(fill = "ADHD Status")
+
+(adhd_age_hist / adhd_age_density) +
+  plot_annotation(title = 'Distribution of Age') +
+  plot_layout(
+    guides = "collect", 
+    heights = c(2, 1)
+  )
+
+ggplot(plot_data, aes(sample = age)) +
+  stat_qq() +
+  stat_qq_line(color = "red") +
+  facet_wrap(~ adhd) +
+  theme_minimal() +
+  labs(title = "Q-Q Plots Age Faceted by ADHD",
+       x = "Theoretical Quantiles",
+       y = "Sample Quantiles")
+# statistical tests
+by(plot_data$age, plot_data$adhd, shapiro.test)
+```
+The age data for each adhd group is not normally distributed.
+
+Just ADHD distributions:
+```{r}
+ggplot(intake_participants, aes(x = height, fill = adhd)) +
+  geom_histogram(position = "identity", alpha = 0.5) +
+  labs(
+    x = "Height",
+    y = "Count",
+    title = "Distribution of height by ADHD",
+    fill = "ADHD"
+  )
+ggplot(plot_data, aes(sample = height)) +
+  stat_qq() + 
+  stat_qq_line(color = "red") + 
+  facet_wrap(~ adhd) +
+  theme_minimal() +
+  labs(title = "Q-Q Plots Height Faceted by ADHD",
+       x = "Theoretical Quantiles",
+       y = "Sample Quantiles")
+
+by(plot_data$height, plot_data$adhd, shapiro.test)
+```
+Height shows nothing out of the ordinary. The data looks slightly normal, and all groups follow similar distributions.
+Although, diagnosed ADHD participants appear to have more skew (slightly).
+Shapiro-Wilk test concludes the data is not normally distributed.
+
+```{r}
+ggplot(plot_data, aes(x = weight, fill = adhd)) +
+  geom_histogram(position = "identity", alpha = 0.5) +
+  labs(
+    x = "Weight",
+    y = "Count",
+    title = "Distribution of weight by ADHD",
+    fill = "ADHD"
+  )
+
+ggplot(plot_data, aes(sample = weight)) +
+  stat_qq() +
+  stat_qq_line(color = "red") +
+  facet_wrap(~ adhd) +
+  theme_minimal() +
+  labs(title = "Q-Q Plots Weight Faceted by ADHD",
+       x = "Theoretical Quantiles",
+       y = "Sample Quantiles")
+
+by(plot_data$weight, plot_data$adhd, shapiro.test)
+```
+The groups follow a large left-skew. We also notice diagnosed the diagnosed ADHD participant with a very hight weight.
+
+We have concluded none of the data is normally-distributed, so we will peform non-parametric tests.
+Specifically, the Kruskal-Wallis test as this is non-parametric, and checks 3 or more groups (required for ADHD variable).
+Null hypothesis: no difference between groups.
+Alternative hypothesis: at least one group's median is different from the others.
+Should I have enough evidence to reject the null hypothesis, I need to have an idea which of the groups is/are different from the others.
+To do this, I will perform the Dunn's test, as I have large samples and tied ranks are more likely (especially with a close age range).
+
+### Checking for group differences
+```{r}
+message("Differences in age:")
+kruskal.test(plot_data$age, plot_data$adhd)
+
+message("Differences in height:")
+kruskal.test(plot_data$height, plot_data$adhd)
+
+message("Differences in weight:")
+kruskal.test(plot_data$weight, plot_data$adhd)
+```
+There is a significant difference in weight among the ADHD groups.
+Looking at the distribution of weight, there are some outliers in the data:
+```{r}
+ggplot(plot_data, aes(x = adhd, y = weight)) +
+  geom_boxplot()
+```
+Diagnosed ADHD has one very large outlier, larger than any of the other groups.
+To see if this outlier is the root cause of the significance, I will try handling the outlier in various ways.
+```{r}
+quantile99 <- quantile(plot_data$weight, 0.99, na.rm = TRUE)
+
+plot_data_filt <- plot_data |>
+  filter(weight <= 200)
+
+plot_data_wins <- plot_data |>
+  mutate(weight = if_else(weight > quantile99, quantile99, weight))
+
+print("Full dataset test:")
+kruskal.test(weight ~ adhd, data = plot_data)
+
+print("Filtered dataset test:")
+kruskal.test(weight ~ adhd, data = plot_data_filt)
+
+print("Winsorized dataset test:")
+kruskal.test(weight ~ adhd, data = plot_data_wins)
+```
+Pulling the outliers down to the 99th percentile and removing any weight above 200 still has a significant conclusion.
+I will perform Dunn's test on the unfiltered data to identify the group difference(s) causing the significance.
+```{r}
+dunn_test(plot_data, weight ~ adhd)
+dunn_test(plot_data, weight ~ adhd, ref.group = "Neurotypical")
+```
+There is a significant difference in weight distributions between Neurotypical and Diagnosed ADHD participants.
+Specifically, there is a difference of 3.5 standard deviations.
+The groups do not have differeing weight, height or age.
+Therefore, it appears that a formal diagnosis of ADHD is associated with a higher body weight (rank) in this data.
+
+I would like to quicky check BMI:
+```{r}
+# BMI calculator (we do have 18 year olds however)
+intake_participants <- intake_participants |> 
+  mutate(
+    bmi = (weight / ((height/100) ^ 2))
+  )
+
+bmi_categories <- data.table(
+  category = c("Underweight", "Healthy weight", "Overweight", "Obese"),
+  bmi_min = c(0, 18.5, 25.0, 30.0),
+  bmi_max = c(18.5, 25.0, 30.0, max(intake_participants$bmi)+5), # set hard limit
+  colour = c("#3498db", "#2ecc71", "#f1c40f", "#e67e22")
+)
+category_palette <- setNames(bmi_categories$colour, bmi_categories$category)
+
+# BMI across countries
+ggplot() +
+  geom_rect(
+    data = bmi_categories, 
+    aes(xmin = -Inf, xmax = Inf, ymin = bmi_min, ymax = bmi_max, fill = category), 
+    alpha = 0.2) +
+  geom_boxplot(
+    data = intake_participants,
+    aes(
+      x = as.factor(country),
+      y = bmi,
+    ),
+    fill = "white"
+    ) +
+  scale_fill_manual(values = category_palette, name = "BMI Categories") +
+  labs(
+    title = "BMI Distribution Across Countries",
+    x = "Country",
+    y = expression(Body ~ Mass ~ Index ~ (kg/m^2))
+  ) +
+  guides(fill = "legend", colour = "none")
+
+# BMI across gender
+ggplot() +
+  geom_rect(
+    data = bmi_categories, 
+    aes(xmin = -Inf, xmax = Inf, ymin = bmi_min, ymax = bmi_max, fill = category), 
+    alpha = 0.2) +
+  geom_boxplot(
+    data = intake_participants,
+    aes(
+      x = as.factor(gender),
+      y = bmi,
+    ),
+    fill = "white"
+    ) +
+  scale_fill_manual(values = category_palette, name = "BMI Categories") +
+  labs(
+    title = "BMI Distribution Across Countries",
+    x = "Gender",
+    y = expression(Body ~ Mass ~ Index ~ (kg/m^2))
+  ) +
+  guides(fill = "legend", colour = "none")
+
+ggplot() +
+  geom_rect(
+    data = bmi_categories, 
+    aes(xmin = -Inf, xmax = Inf, ymin = bmi_min, ymax = bmi_max, fill = category), 
+    alpha = 0.2) +
+  geom_boxplot(
+    data = intake_participants,
+    aes(
+      x = fct_infreq(ethnicity),
+      y = bmi
+    ),
+    fill = "white"
+    ) +
+  scale_fill_manual(values = category_palette, name = "BMI Categories") +
+  scale_colour_brewer(palette = "Set2", name = "Ethnicity") +
+  labs(
+    title = "BMI Distribution Across Gender",
+    x = "Ethnicities",
+    y = expression(Body ~ Mass ~ Index ~ (kg/m^2))
+  ) +
+  guides(fill = "legend", colour = "none") +
+  coord_flip()
+```
+
+Now for the categoric variables:
+```{r}
+for (col in demographic_vars[!demographic_vars %in% c("pid", "geo_area", "height", "weight", "age")]) {
+  col_freq <- intake_participants |> count(.data[[col]])
+  pretty_col <- str_replace_all(str_to_title(col), "_", " ")
+  print(
+    ggplot(col_freq, aes(x = n, y = fct_reorder(.data[[col]], n), fill = .data[[col]])) +
+    geom_col() +
+    coord_cartesian(clip = "off") +
+    geom_text(aes(label = n), hjust = 0) +
+    labs(
+      x = "Count",
+      y = pretty_col,
+      title = paste("Counts of", pretty_col)
+    ) +
+    theme(
+      legend.position = "none"
+    )
+  )
+}
+```
+May be worth considering Independent (the american party) was assumed to be no affiliation by the UK participants:
+```{r}
+intake_participants |> filter(political_party == "Independent") |> pull(country) |> table()
+```
+No one from the UK stated this, which is good.
+
+# Video Game Statistics
+
+## General Descriptive Statistics
+
+This focuses on more about the general information taken from the participant data (connected platforms, self reported hours, proportion).
+
+```{r}
+linked_platform_intake <- intake_participants |> 
+  select(all_of(c(demographic_vars, "linked_platforms"))) |> 
+  separate_longer_delim(linked_platforms, delim = ", ") |> 
+  rename(platform = linked_platforms)
+
+# bar chart of platform frequency
+linked_platform_intake |>
+  count(platform) |> 
+  mutate(platform = if_else(is.na(platform), "NA", platform)) |> 
+  ggplot(aes(x = fct_reorder(platform, n), y = n, fill = platform)) +
+  geom_col() +
+  geom_text(aes(label = n, vjust = -0.5), position = position_dodge(0.9)) +
+  labs(x = "Platform", y = "Count", title = "Participants' linked platforms") +
+  theme(legend.position = "none")
+
+# platform by age
+ggplot(linked_platform_intake, aes(x = as.factor(platform), y = age)) +
+  geom_boxplot()
+
+# by country
+linked_platform_intake |>
+  count(platform, country) |> 
+  mutate(platform = if_else(is.na(platform), "NA", platform)) |> 
+  ggplot(aes(x = fct_reorder(platform, n), y = n, fill = country)) +
+  geom_col(position = position_dodge()) +
+  geom_text(aes(label = n, vjust = -0.5), position = position_dodge(0.9)) +
+  labs(x = "Platform", y = "Count", title = "Participants' linked platforms")
+
+# by gender
+linked_platform_intake |>
+  count(platform, gender) |> 
+  mutate(platform = if_else(is.na(platform), "NA", platform)) |> 
+ ggplot(aes(x = fct_reorder(platform, n), y = n, fill = gender)) +
+  geom_col(position = position_dodge()) +
+  geom_text(aes(label = n, vjust = -0.5), position = position_dodge(0.9)) +
+  labs(x = "Platform", y = "Count", title = "Participants' linked platforms")
+
+# by ADHD
+linked_platform_intake |>
+  count(platform, adhd) |> 
+  mutate(platform = if_else(is.na(platform), "NA", platform)) |> 
+  ggplot(aes(x = fct_reorder(platform, n), y = n, fill = adhd)) +
+  geom_col(position = position_dodge()) +
+  geom_text(aes(label = n, vjust = -0.5), position = position_dodge(0.9)) +
+  labs(x = "Platform", y = "Count", title = "Participants' linked platforms by ADHD")
+
+linked_platform_intake |>
+  count(adhd, platform) |>
+  mutate(platform = if_else(is.na(platform), "NA", platform), n_pct = n / sum(n)) |>
+  ggplot(aes(x = fct_reorder(adhd, n), y = n_pct, fill = platform)) +
+  geom_col(position = position_dodge()) +
+  scale_y_continuous(labels = scales::label_percent()) +
+  geom_text(aes(label = n, vjust = -0.5), position = position_dodge(0.9)) +
+  labs(x = "ADHD", y = "Count", title = "Participants' linked platforms by ADHD")
+```
+Only US participants linked their Xbox account
+
+A quick comparison with the demographic variables
+
+Now I will look at the platforms average use at different aggregation levels.
+Some people were qualified participants, but never linked platforms.
+
+I will quickly see if there is a difference in ages between platforms, as I think android may have a older age distribution.
+As the data rows are dependent, I will do some quick re-modelling.
+I will convert the platforms into binary indicators and fit a linear model.
+
+```{r}
+age_platform_data <- intake_participants |>
+  select(all_of(c(demographic_vars, "linked_platforms"))) |>
+  mutate(
+    adhd = as.factor(adhd),
+    linked_steam = if_else(str_detect(str_replace_na(linked_platforms), "Steam"), 1, 0),
+    linked_nintendo = if_else(str_detect(str_replace_na(linked_platforms), "Nintendo"), 1, 0),
+    linked_xbox = if_else(str_detect(str_replace_na(linked_platforms), "Xbox"), 1, 0),
+    linked_ios = if_else(str_detect(str_replace_na(linked_platforms), "iOS"), 1, 0),
+    linked_android = if_else(str_detect(str_replace_na(linked_platforms), "Android"), 1, 0),
+    linked_none = if_else(is.na(linked_platforms), 1, 0)
+  ) |>
+  select(age, adhd,
+    linked_steam, linked_nintendo, linked_xbox,
+    linked_ios, linked_android, linked_none
+  )
+
+# linear model
+age_platform_lm <- lm(
+  age ~
+    linked_steam + linked_nintendo + linked_xbox +
+      linked_ios + linked_android + linked_none,
+  data = age_platform_data
+)
+summary(age_platform_lm)
+```
+Base age, regardless of platform is 27.8 years.
+Linking steam reduces the average age by 1.24 years.
+Nintendo and ios has no significant effect on age.
+Linking android or xbox sees an increase in age by 1.25 and 1.55 respectively.
+
+```{r}
+weekly_platforms <- linked_platform_intake |>
+  left_join(weekly_all, by = c("pid", "platform")) |>
+  filter(!is.na(week)) # missing week also misses minutes, this is of no use
+
+daily_platforms <- linked_platform_intake |> 
+  left_join(daily_telemetry, by = c("pid", "platform")) |> 
+  rename(day = day_local) |> 
+  filter(!is.na(day)) # missing day also misses minutes, no reason to keep here
+
+message("Summary of weekly platforms:")
+weekly_platforms |>
+  mutate(across(where(is.character), as.factor)) |> 
+  skim() |>
+  print()
+
+message("Summary of daily platforms:")
+daily_platforms |>
+  mutate(across(where(is.character), as.factor)) |> 
+  skim() |>
+  print()
+```
+
+
+```{r}
+ggplot(weekly_platforms, aes(x = minutes, y = platform, fill = platform)) +
+  geom_boxplot() +
+  theme(legend.position = "none") +
+  facet_wrap(~country) +
+  labs(x = "Minutes played", y = "Platform", title = "Weekly platform playtime per country")
+
+ggplot(weekly_platforms, aes(x = minutes, y = platform, fill = platform)) +
+  geom_boxplot() +
+  theme(legend.position = "none") +
+  facet_wrap(~gender) +
+  labs(x = "Minutes played", y = "Platform", title = "Weekly platform playtime by gender")
+
+ggplot(daily_platforms, aes(x = minutes, y = platform, fill = platform)) +
+  geom_boxplot() +
+  theme(legend.position = "none") +
+  facet_wrap(~country) +
+  labs(x = "Minutes played", y = "Platform", title = "Daily platform playtime by country")
+
+ggplot(daily_platforms, aes(x = minutes, y = platform, fill = platform)) +
+  geom_boxplot() +
+  theme(legend.position = "none") +
+  facet_wrap(~gender) +
+  labs(x = "Minutes played", y = "Platform", title = "Daily platform playtime by gender")
+```
+These boxplots have a lot of outliers, I will try a density plot for a bit better comparisons.
+It also highlights a large right skew in the data, so some form of logarithm transformation may be required.
+
+```{r}
+daily_counts <- ggplot(daily_platforms, aes(x = minutes, colour = platform)) +
+  geom_freqpoly(bins = 25) +
+  labs(
+    x = "Minutes played",
+    y = "Count",
+    colour = "Platform"
+  )
+
+daily_density <- ggplot(daily_platforms, aes(x = minutes, y = after_stat(density), colour = platform)) +
+  geom_freqpoly(binwidth = 30) +
+  labs(
+    x = "Minutes played",
+    y = "Density",
+    colour = "Platform"
+  )
+
+daily_counts + daily_density +
+  plot_layout(guides = "collect") +
+  plot_annotation(title = 'Average daily playtime')
+
+weekly_counts <- ggplot(weekly_platforms, aes(x = minutes, colour = platform)) +
+  geom_freqpoly(bins = 50) +
+  labs(
+    x = "Minutes played",
+    y = "Count",
+    colour = "Platform"
+  )
+
+weekly_density <- ggplot(weekly_platforms, aes(x = minutes, y = after_stat(density), colour = platform)) +
+  geom_freqpoly(binwidth = 120) +
+  labs(
+    x = "Minutes played",
+    y = "Density",
+    colour = "Platform"
+  )
+
+weekly_counts + weekly_density +
+  plot_layout(guides = "collect") +
+  plot_annotation(title = "Average weekly playtime")
+```
+This again highlights the skew of the data.
+We notice that daily, android and ios have the fewest minutes played and most people play them very little
+
+```{r}
+# 95% confidence intervals
+# plot weekly telemetry by platform
+ggplot(weekly_platforms, aes(x = week, y = minutes)) +
+  # 95% confidence intervals for overall playtime
+  stat_summary(aes(group = 1), geom = "ribbon", fun.data = mean_cl_boot,  alpha = 0.2) +
+  stat_summary(aes(group = 1, linetype = "Mean"), geom = "line", fun = mean) +
+  # 95% confidence intervals for each platform
+  stat_summary(aes(group = platform, fill = platform), geom = "ribbon", fun.data = mean_cl_boot, alpha = 0.2) +
+  # mean playtime per platform
+  stat_summary(aes(group = platform, colour = platform), geom = "line", fun = mean) +
+  scale_linetype_manual(values = c("Mean" = "dashed"), name = "Global") +
+  scale_x_date(date_breaks = "3 months", date_labels = "%m/%y") +
+  labs(
+    title = "Average weekly playtime (95% Confidence Intervals)",
+    x = "Date",
+    y = "Average Weekly Playtime",
+    fill = "Platform",
+    colour = "Platform"
+  )
+```
+
+We can see Xbox has a higher average weekly playtime, larger than any other platform.
+Nintendo is consistently lower, which I was slightly surprised with as I expected the portability of the Switch to factor into playtime.
+
+```{r}
+# 95% confidence intervals
+# plot weekly telemetry by platform
+ggplot(daily_platforms, aes(x = day, y = minutes)) +
+  # 95% confidence intervals for overall playtime
+  stat_summary(aes(group = 1), geom = "ribbon", fun.data = mean_cl_boot,  alpha = 0.2) +
+  stat_summary(aes(group = 1, linetype = "Mean"), geom = "line", fun = mean) +
+  # 95% confidence intervals for each platform
+  stat_summary(aes(group = platform, fill = platform), geom = "ribbon", fun.data = mean_cl_boot, alpha = 0.2) +
+  # mean playtime per platform
+  stat_summary(aes(group = platform, colour = platform), geom = "line", fun = mean) +
+  scale_linetype_manual(values = c("Mean" = "dashed"), name = "Global") +
+  scale_x_date(date_breaks = "3 months", date_labels = "%m/%y") +
+  labs(
+    title = "Average daily playtime (95% Confidence Intervals)",
+    x = "Date",
+    y = "Average Daily Playtime",
+    fill = "Platform",
+    colour = "Platform"
+  )
+```
+
+
+# ADHD
+
+```{r}
+table(intake_participants$adhd)
+```
+
+Now I shall quickly reproduce some of the previous visualisations to see if there are any differences taking the factor of ADHD into account:
+```{r}
+# descriptive statistics of telemetry data, grouped by ADHD
+weekly_telemetry_adhd_stats <- weekly_platforms |>
+  group_by(adhd) |> 
+  summarise(
+    n = n(),
+    mean = mean(minutes, na.rm = TRUE),
+    min = min(minutes, na.rm = TRUE),
+    q1 = quantile(minutes, probs = 0.25, na.rm = TRUE),
+    median = median(minutes),
+    mad = mad(minutes),
+    q3 = quantile(minutes, probs = 0.75, na.rm = TRUE),
+    iqr = IQR(minutes, na.rm = TRUE),
+    max = max(minutes, na.rm = TRUE),
+    skew = (n() * sum((minutes - mean(minutes, na.rm = TRUE))^3, na.rm = TRUE)) /
+      ((n() - 1) * (n() - 2) * sd(minutes, na.rm = TRUE)^3)
+  )
+
+print(weekly_telemetry_adhd_stats)
+
+# barcharts of adhd, faceted by platforms
+ggplot(linked_platform_intake, aes(x = fct_infreq(adhd), fill = adhd)) +
+  geom_bar() +
+  facet_wrap(~platform, scales = "free_y") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    title = "Frequency of platforms by ADHD Status",
+    x = "ADHD Status",
+    y = "Count"
+  )
+
+# proportions of each adhd diagnosis that play a platform
+linked_platform_intake |>
+  group_by(adhd, platform) |>
+  summarise(count = n(), .groups = "drop_last") |>
+  mutate(proportion = count / sum(count)) |>
+  ungroup() |>
+  ggplot(aes(x = adhd, y = proportion, fill = adhd)) +
+  geom_col() +
+  geom_text(aes(label = paste0(round(proportion * 100, 1), "%")), vjust = -0.5) +
+  facet_wrap(~platform) +
+  scale_y_continuous(
+    labels = scales::label_percent(),
+    expand = expansion(mult = c(0, 0.25))
+  ) +
+  scale_fill_brewer(palette = "Set2", name = "ADHD Status") +
+  labs(
+    title = "Proportion of ADHD Cohorts across Gaming Platforms",
+    x = "ADHD Diagnostic Group",
+    y = "Proportion (%)"
+  ) +
+  theme(
+    axis.text.x = element_text(
+      angle = 45, hjust = 1, face = "bold", size = 6
+    ),
+    panel.grid.major.x = element_blank(),
+    legend.position = "none"
+  )
+
+# boxplot of adhd telemetry
+ggplot(weekly_platforms, aes(x = minutes, y = adhd)) +
+  geom_boxplot()
+
+# distributions of telemetry
+ggplot(weekly_platforms, aes(x = minutes, colour = adhd)) +
+  geom_density() +
+  guides(colour = "none") +
+  ggplot(weekly_platforms, aes(x = minutes, colour = adhd)) +
+  geom_freqpoly() +
+  plot_layout(guides = "collect")
+
+# game telemetry trends with 95% CI, faceted by platform
+ggplot(weekly_platforms, aes(x = week, y = minutes)) +
+  stat_summary(aes(fill = adhd), geom = "ribbon", fun.data = mean_cl_boot, alpha = 0.2) +
+  # mean playtime per adhd group
+  stat_summary(aes(colour = adhd), geom = "line", fun = mean) +
+  scale_x_date(
+    breaks = scales::breaks_pretty(n = 5),
+    minor_breaks = "1 month",
+    labels = scales::label_date_short()
+  ) +
+  facet_wrap(~platform, scales = "free") +
+  labs(
+    title = "Average weekly playtime (95% Confidence Intervals)",
+    x = "Date",
+    y = "Average Weekly Playtime",
+    fill = "ADHD",
+    colour = "ADHD"
+  )
+```
+Now I shall see if there is any significance in the variation of the sessions, highlighting sessions of focus or distractions:
+```{r}
+participant_adhd <- intake_participants |> select(pid, adhd)
+steam_sessions <- steam |>
+  mutate(platform = "Steam") |>
+  left_join(participant_adhd, by = "pid") |> 
+  select(
+    pid, adhd,
+    platform,
+    session_start = approximate_session_start,
+    session_end = approximate_session_end,
+    duration = minutes
+  )
+
+# Xbox/Nintendo
+xbox_nintendo_sessions <- session_telemetry |>
+  left_join(participant_adhd, by = "pid") |>
+  select(
+    pid, adhd,
+    platform,
+    session_start, session_end, duration
+  )
+
+adhd_sessions <- bind_rows(steam_sessions, xbox_nintendo_sessions)
+
+# adhd session variations
+# NOTE: there will be less people than the intake participants.
+# some did not send videogame data, just survey responses
+adhd_sessions_variation <- adhd_sessions |>
+  # only get intake participants
+  filter(pid %in% participants_pid) |> 
+  group_by(pid, platform, adhd) |>
+  summarise(
+    total_sessions = n(),
+    median_duration = median(duration, na.rm = TRUE),
+    # session variability (hyperfocus & erratic play patterns)
+    iqr_duration = IQR(duration, na.rm = TRUE),
+    cv_duration = sd(duration, na.rm = TRUE) / mean(duration, na.rm = TRUE),
+    # behavioral proportions
+    prop_short_bursts = mean(duration < 15, na.rm = TRUE),
+    prop_hyperfocus   = mean(duration > 180, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Remember these do not include ios/android as we cannot get session telemetry
+# The platform statistic is for the group, not a participant statistic
+table_adhd <- adhd_sessions_variation |>
+  select(-pid) |>
+  tbl_summary(
+    by = adhd,
+    statistic = list(all_continuous() ~ "{median} ({p25}, {p75})"),
+    label = list(
+      platform ~ "Platform",
+      total_sessions ~ "Total Sessions Logged",
+      median_duration ~ "Median Session Length (Mins)",
+      iqr_duration ~ "Within-Person IQR (Variance)",
+      cv_duration ~ "Coefficient of Variation",
+      prop_short_bursts ~ "Proportion of Micro-Sessions (<15m)",
+      prop_hyperfocus ~ "Proportion of Hyperfocus Sessions (>180m)"
+    )
+  ) |>
+  # p-values - automatically detects non-normal data and uses Kruskal-Wallis
+  add_p() |> 
+  bold_p(t = 0.05) |>
+  add_overall() |>
+  bold_labels()
+
+table_adhd
+```
+This appears to indicate that people with ADHD do not seem to have significantly different session times, particularly sessions of hyper-focus or micro-sessions.
+The only thing of statistical significance is the Median Session Length.
+
+I can extend this by looking at the number of sessions against the duration of sessions:
+```{r}
+# median session vs total session per participant
+ggplot(adhd_sessions_variation, aes(x = total_sessions, median_duration, colour = adhd)) +
+  geom_point() +
+  scale_x_continuous(breaks = scales::breaks_pretty(n = 10)) +
+  labs(
+    title = "Median Session Duration against the Number of Sessions",
+    x = "No. sessions",
+    y = "Median session duration",
+    colour = "ADHD"
+  )
+
+# zooming for up to 1000 sessions
+ggplot(adhd_sessions_variation, aes(x = total_sessions, median_duration, colour = adhd)) +
+  geom_point() +
+  xlim(0, 1000) +
+  labs(
+    title = "Median Session Duration against the Number of Sessions (<= 1000)",
+    x = "No. sessions",
+    y = "Median session duration",
+    colour = "ADHD"
+  )
+
+# density distributions of the number of sessions and session durations
+ggplot(adhd_sessions_variation, aes(x = total_sessions, fill = adhd)) +
+  geom_density(alpha = 0.3) +
+  labs(
+    title = "Distributions of total sessions per participant grouped by ADHD diagnosis",
+    x = "Total sessions per participant",
+    y = "Density",
+    fill = "ADHD"
+  )
+ggplot(adhd_sessions_variation, aes(x = median_duration, fill = adhd)) +
+  geom_density(alpha = 0.3) +
+  labs(
+    title = "Distributions of a participant's median session duration grouped by ADHD diagnosis",
+    x = "Median session duration per participant",
+    y = "Density",
+    fill = "ADHD"
+  )
+ggplot(adhd_sessions_variation, aes(x = iqr_duration, fill = adhd)) +
+  geom_density(alpha = 0.3) +
+  labs(
+    title = "Distributions of a participant's IQR of session durations grouped by ADHD diagnosis",
+    x = "Session IQR participant",
+    y = "Density",
+    fill = "ADHD"
+  )
+```
+
+# Well-being data
+
+This is split into two: panel (biweekly) and daily. It is important to note according to the paper, the daily data does not contain any UK participants, and consists of all the Xbox telemetry (none of the UK participants had linked Xbox data).
+
+```{r}
+panel_pid <- unique(biweekly$pid)
+daily_pid <- unique(daily$pid)
+
+message("Daily survey participants by country:")
+intake_participants |> filter(pid %in% daily_pid) |> pull(country) |> table() |> print()
+
+message("Xbox participants by country:")
+linked_platform_intake |>
+  filter(pid %in% c(panel_pid, daily_pid), platform == "Xbox") |> 
+  pull(country) |> 
+  table() |> print()
+```
+Interestingly, there are 23 participants from the UK in the daily surveys.
+22 of them are from the pilot study, so potentially the participant not in the survey may have moved from America and now resides in the UK.
+
+## Daily
+I will check the daily well-being data first. I will get an initial idea of the participants (how many responses they did)
+```{r}
+daily_participants <- daily |> filter(pid %in% participants_pid)
+
+# general retention
+daily |>
+  group_by(wave) |> 
+  summarise(
+    responses = n(),
+    prop_retention = responses / length(daily_pid),
+  ) |> 
+  ggplot(aes(x = wave, y = responses)) +
+  geom_point() +
+  geom_line() +
+  scale_x_continuous(
+    name = "Wave",
+    breaks = scales::breaks_width(5, offset = 0),
+    minor_breaks = scales::minor_breaks_width(1, offset = 0),
+    expand = expansion()
+  ) +
+  scale_y_continuous(
+    name = "Responses",
+    sec.axis = sec_axis(
+      ~. / length(daily_pid),
+      name = "Retention %",
+      labels = scales::label_percent(),
+    )
+  ) +
+  labs(
+    title = "Retention rates of Daily survey"
+  )
+
+# survey durations (time to complete)
+daily |> filter(pid %in% participants_pid) |>
+  select(wave, survey_duration, affective_valence, life_sat) |> 
+  ggplot(aes(x = wave, y = survey_duration, group = wave)) +
+  geom_boxplot() +
+  labs(title = "Survey duration for each daily survey")
+```
+
+We have some extremely large survey durations. Let's check the outliers.
+```{r}
+# do it based on each wave, as retention changes over time
+# overall average is not representative
+wave_duration_outliers <- daily_participants |> 
+  group_by(wave) |>
+  summarise(
+    low_threshold = mean(survey_duration) - (1.5 * IQR(survey_duration)),
+    high_threshold = mean(survey_duration) + (1.5 * IQR(survey_duration))
+  )
+print(wave_duration_outliers, n = Inf)
+
+daily_duration_outliers <- daily_participants |>
+  left_join(wave_duration_outliers, by = join_by(wave)) |>
+  filter(
+    (survey_duration < low_threshold) |
+    (survey_duration > high_threshold)
+  )
+daily_duration_outliers
+```
+There are nearly 7000 survey responses that are outliers with respect to the survey duration.
+Interestingly, daily waves 1, 2, 3, 4, 9, 10, and 12 took considerably longer than the other days.
+The reason for this is because there were considerably larger survey response times (170,000s in some cases),
+which have skewed the distribution.
+
+```{r}
+daily_duration_outliers |>
+  summarise(
+    n_low_outliers = sum(if_else(
+      survey_duration < low_threshold,
+      1,
+      0
+    )),
+    n_high_outliers = sum(if_else(
+      survey_duration > high_threshold,
+      1,
+      0
+    ))
+  )
+
+daily_duration_outliers <- daily_duration_outliers |>
+  mutate(
+    outlier_type = case_when(
+      survey_duration < low_threshold ~ "Low",
+      survey_duration > high_threshold ~ "High"
+    )
+  )
+
+# Summarise survey durations for each wave
+tapply(daily_duration_outliers$survey_duration, daily_duration_outliers$wave, summary)
+```
+Looking at each daily wave's median survey duration, they are more reasonable and better grouped.
+Nobody failed the bpnsfs attention check, structural missingness (didn't play games, missing bangs data etc.)
+
+### BANGS
+In the daily survey, the BANGS measures mean the following:
+- bangs1: autonomy satisfaction
+- bangs2: autonomy frustration
+- bangs3: comptence satisfaction
+- bangs4: competence frustration
+- bangs5: relatedness satisfaction
+- bangs6: relatedness frustration
+
+```{r}
+daily_wave1 <- daily |> filter(wave == 1)
+
+# BANGS
+daily_bangs <- daily_participants |>
+  pivot_longer(
+    cols = starts_with("bangs_")
+  )
+
+# full daily BANGS
+ggplot(daily_bangs, aes(x = value)) +
+  geom_histogram(bins = 7) +
+  facet_wrap(~name) +
+  labs(
+    title = "Daily participants BANGS scores",
+    subtitle = "All types of games"
+  )
+
+# single player
+daily_bangs |>
+  ggplot(aes(x = value, fill = social_gaming_4)) +
+  geom_histogram(bins = 7, position = "identity", alpha = 0.5) +
+  facet_wrap(~name) +
+  labs(
+    title = "Daily participants BANGS scores",
+    subtitle = "Single-player games"
+  )
+
+# multiplayer with real-world friends
+daily_bangs |>
+  ggplot(aes(x = value, fill = social_gaming_5)) +
+  geom_histogram(bins = 7) +
+  facet_wrap(~name) +
+  labs(
+    title = "Daily participants BANGS scores",
+    subtitle = "Multiplayer with real-world friends"
+  )
+
+# multiplayer with online-only friends
+daily_bangs |>
+  ggplot(aes(x = value, fill = social_gaming_6)) +
+  geom_histogram(bins = 7) +
+  facet_wrap(~name) +
+  labs(
+    title = "Daily participants BANGS scores",
+    subtitle = "Multiplayer with online-only friends"
+  )
+
+# multiplayer with strangers
+daily_bangs |>
+  ggplot(aes(x = value, fill = social_gaming_7)) +
+  geom_histogram(bins = 7) +
+  facet_wrap(~name) +
+  labs(
+    title = "Daily participants BANGS scores",
+    subtitle = "Multiplayer with strangers"
+  )
+```
+
+```{r}
+message("Pearson")
+# pearson BANGS correlations
+daily_participants |> select(starts_with("bangs_")) |> 
+  cor(method = "pearson", use = "pairwise.complete.obs")
+message("Spearman")
+# spearman correlations
+daily_participants |> select(starts_with("bangs_")) |> 
+  cor(method = "spearman", use = "pairwise.complete.obs")
+```
+We see positive correlations when comparing the satisfaction and frustration variables with their own groups,
+and negative correlations when comparing pairs of opposing groups.
+This is to be expected.
+
+I will reverse code bangs 2, 4 and 6 (negative emotion scales) and create a total.
+```{r}
+daily_participants <- daily_participants |> 
+  mutate(
+    bangs_2_reversed = 8 - bangs_2,
+    bangs_4_reversed = 8 - bangs_4,
+    bangs_6_reversed = 8 - bangs_6,
+    bangs_tot = bangs_1 + bangs_2_reversed + bangs_3 +
+      bangs_4_reversed + bangs_5 + bangs_6_reversed
+  )
+
+# BANGS total
+ggplot(daily_participants, aes(x = bangs_tot)) +
+  geom_histogram(bins = 42) +
+  labs(
+    title = "Daily participants total BANGS score",
+  )
+```
+In general, daily survey participants:
+- Found they could play the game they wanted (bangs 1)
+- Not very often wished they could do something else (bangs 2, some correlation with bangs_1)
+- They felt they made progress whilst playing (bangs 3)
+- Didn't feel disappointed with their performance (bangs 4)
+- Varied feelings of relationships with characters/players (bangs 5)
+- Strongly felt interactions with characters/players felt toxic (bangs 6)
+
+Overall these appear to show positive experiences whilst playing video games, indicated by a left skew of the total BANGS distribution.
+
+### BPNSFS
+
+```{r}
+daily_participants |>
+  pivot_longer(
+    cols = c("bpnsfs_1", "bpnsfs_2", "bpnsfs_3", "bpnsfs_4", "bpnsfs_5", "bpnsfs_6"),
+    names_to = "bpnsfs",
+    values_to = "value"
+  ) |> 
+  ggplot(aes(x = value)) +
+  geom_histogram(bins=5) +
+  facet_wrap(~bpnsfs) +
+  labs(title = "Daily participants' BPNSFS scores")
+
+# variable recoding again
+daily_participants <- daily_participants |> 
+  mutate(
+    bpnsfs_2_reversed = 8 - bpnsfs_2,
+    bpnsfs_4_reversed = 8 - bpnsfs_4,
+    bpnsfs_6_reversed = 8 - bpnsfs_6,
+    bpnsfs_tot = bpnsfs_1 + bpnsfs_2_reversed + bpnsfs_3 +
+      bpnsfs_4_reversed + bpnsfs_5 + bpnsfs_6_reversed
+  )
+
+# BPNSFS total
+ggplot(daily_participants, aes(x = bpnsfs_tot)) +
+  geom_histogram(bins = 30) +
+  labs(
+    title = "Daily participants total BPNSFS score",
+  )
+
+daily_participants |>
+  group_by(bpnsfs_1, bpnsfs_2, bpnsfs_3, bpnsfs_4, bpnsfs_5, bpnsfs_6) |>
+  count() |>
+  arrange(-n)
+```
+We see clear patterns of positive well-being and life satisfaction.
+I will now check the correlations to get an idea of participant's experiences:
+```{r}
+daily_bpnsfs_cols <- c("bpnsfs_1", "bpnsfs_2", "bpnsfs_3", "bpnsfs_4", "bpnsfs_5", "bpnsfs_6")
+message("Pearson correlation of BPNSFS")
+daily_participants |>
+  select(all_of(daily_bpnsfs_cols)) |>
+  cor(method = "pearson", use = "pairwise.complete.obs")
+
+message("Spearman correlation of BPNSFS")
+daily_participants |>
+  select(all_of(daily_bpnsfs_cols)) |>
+  cor(method = "spearman", use = "pairwise.complete.obs")
+```
+We see a similar pattern again.
+
+### Stress
+
+First, I am looking at the general stress levels of all responses of participants.
+```{r}
+table(daily_participants$had_stress)
+
+# % of people who said yes more than once
+multiple_stress_pid <- daily_participants |>
+  count(pid, had_stress) |>
+  filter(had_stress == "Yes", n > 2) |>
+  pull(pid)
+
+stress_counts <- daily_participants |>
+  count(pid, had_stress) |>
+  filter(had_stress == "Yes", n > 2)
+
+print(paste0(round(length(multiple_stress_pid) / length(daily_pid) * 100), "% of people were stressed more than once"))
+
+multiple_stress <- daily_participants |>
+  filter(pid %in% multiple_stress_pid)
+
+multiple_stress_intake <- intake_participants |>
+  filter(pid %in% multiple_stress_pid)
+```
+
+Now I will check the stats of the people who were stressed more than once:
+```{r}
+# TODO: change to account for people who had multiple instances of stress
+intake_daily_wave1 <- intake_participants |>
+  filter(pid %in% daily_pid) |>
+  left_join(daily_participants |> select(pid, had_stress), by = join_by(pid))
+
+table(intake_daily_wave1$adhd)
+table(intake_daily_wave1$country)
+ggplot(intake_daily_wave1, aes(x = age, fill = had_stress)) +
+  geom_density(alpha = 0.5)
+```
+
+### Satisfaction and Affective Valence
+
+I will group these by date rather and study day separately.
+```{r}
+daily_satisfaction <- daily_participants |>
+  select(pid, date, wave, affective_valence, life_sat) |>
+  right_join(intake_participants, by = join_by(pid), keep = FALSE) |>
+  select(!ends_with(".y")) |>
+  rename_with(~ str_remove(., ".x"))
+
+
+# study day
+ggplot(daily_satisfaction, aes(x = wave)) +
+  # life satisfaction
+  stat_summary(aes(y = life_sat, colour = "Life Satisfaction"), geom = "ribbon", fun.data = mean_cl_boot,  alpha = 0.2) +
+  stat_summary(aes(y = life_sat, colour = "Life Satisfaction"), geom = "line", fun = mean) +
+  # affective valence
+  stat_summary(aes(y = affective_valence, colour = "Affective Valence"), geom = "ribbon", fun.data = mean_cl_boot,  alpha = 0.2) +
+  stat_summary(aes(y = affective_valence, colour = "Affective Valence"), geom = "line", fun = mean) +
+  labs(
+    title = "Average daily life satisfaction (95% Confidence Intervals)",
+    x = "Wave",
+    y = "Score"
+  )
+
+# both distributions
+ggplot(daily_satisfaction) +
+  geom_histogram(aes(x = life_sat, fill = "Life Satisfaction")) +
+  geom_histogram(aes(x = affective_valence, fill = "Affective Valence"))
+
+# distribution of each, coloured by ADHD
+adhd_life_sat <- ggplot(daily_satisfaction, aes(x = life_sat, fill = adhd)) +
+  geom_density(alpha = 0.5) +
+  labs(
+    title = "Distribution of Life Satisfaction (0-100)",
+    subtitle = "'I was satisfied with my life today'"
+  )
+
+adhd_aff_val <- ggplot(daily_satisfaction, aes(x = affective_valence, fill = adhd)) +
+  geom_density(alpha = 0.5) +
+  labs(
+    title = "Distribution of Affective Valence (0-100)",
+    subtitle = "'How are you feeling right now'"
+  )
+
+adhd_life_sat + adhd_aff_val
+```
+Looking at the two distributions, we can see that ever so slightly, ADHD people have worse life satisfaction and affective valence.
+
+Statistical test to prove similar distributions:
+```{r}
+cor(daily_satisfaction$life_sat, daily_satisfaction$affective_valence, method = "spearman", use = "complete.obs")
+cor(daily_satisfaction$life_sat, daily_satisfaction$affective_valence, method = "pearson", use = "pairwise.complete.obs")
+```
+
+
+## Panel 1 (Biweekly)
+
+TODO: perform factor analysis across the waves
+
+```{r}
+# Assess retention and response distribution across biweekly waves
+biweekly_participants <- biweekly |> 
+  filter(pid %in% participants_pid)
+
+biweekly_retention <- biweekly_participants |>
+  group_by(wave) |>
+  summarise(
+    responses = n(),
+    prop_retention = responses / length(panel_pid)
+  )
+
+ggplot(biweekly_retention, aes(x = wave, y = responses)) +
+  geom_point() +
+  geom_line() +
+  scale_x_continuous(breaks = scales::breaks_width(1)) +
+  scale_y_continuous(
+    name = "Responses",
+    sec.axis = sec_axis(~ . / length(panel_pid), name = "Retention %", labels = scales::label_percent())
+  ) +
+  labs(
+    title = "Biweekly Panel Retention Across Waves",
+    x = "Wave"
+  )
+```
+
+
+## Telemetry Related
+When I explore this, I need to be mindful of between-person effects (does a person playing more/less than the average have better/worse well-being) and within-person effects (if a person plays more/less than normal, does their well-being improve/worsen).
+
+To do this, I need to get the total weekly minutes played per participant, calculate their average weekly playtime (their between-person baseline), and calculate their deviation (residual?) from their baseline every week (within-person).
+
+I can apply this to various well-being scales as well, using their total.
+```{r}
+# group by pid and week
+
+# telemetry:
+# between effects: pid average playtime across all weeks
+# within effects: specific week - average playtime
+weekly_telemetry_effects <- weekly_platforms |>
+  group_by(pid) |>
+  mutate(
+    # between-person: Baseline average weekly playtime per participant
+    playtime_pmean = mean(minutes, na.rm = TRUE),
+    # within-person: Weekly deviation from the participant's own baseline
+    playtime_pdev = minutes - playtime_pmean
+  ) |>
+  ungroup()
+
+# distribution of within-person deviations
+ggplot(weekly_telemetry_effects, aes(x = playtime_pdev, fill = platform)) +
+  geom_density(alpha = 0.6) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  facet_wrap(~platform, scales = "free_y") +
+  labs(
+    title = "Within-Person Playtime Deviations by Platform",
+    subtitle = "Zero represents a participant's average weekly playtime",
+    x = "Deviation from Personal Mean (Minutes)",
+    y = "Density",
+    fill = "Platform"
+  ) +
+  theme(legend.position = "none")
+```
+

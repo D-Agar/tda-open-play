@@ -1,8 +1,12 @@
 ---
 title: "Open Play: Data Understanding"
 author: "Daniel Agar"
-format: html
-abstract: "This document contains the initial exploration of the Open Play dataset, which has already been cleaned"
+format:
+  pdf: default
+  html:
+    toc: true
+  docx: default
+abstract: "This document contains the initial exploration of the Open Play dataset, but focuses on getting an analysis-ready intake dataset."
 ---
 
 This document explores the clean version of the data set Open Play.
@@ -813,26 +817,16 @@ table(intake_participants$employment, useNA = "ifany")
 The rest of the demographic missingness appears to be individuals not disclosing their information, but I will check these instances for any unusual records to be sure:
 
 ```{r}
-# Neurodiverse flags
-# is_neurotypical = neuro_identify == "No" | is.na(neuro_identify),
-# is_adhd = !is.na(neuro_iden_adhd) | !is.na(neuro_diag_adhd),
-# is_dyscalculia = !is.na(neuro_iden_dyscalculia) | !is.na(neuro_diag_dyscalculia),
-# is_dyspraxia = !is.na(neuro_iden_dyspraxia) | !is.na(neuro_diag_dyspraxia),
-# is_ocd = !is.na(neuro_iden_ocd) | !is.na(neuro_diag_ocd),
-# is_prefer_not_say = !is.na(neuro_iden_prefer_not_say) | !is.na(neuro_diag_prefer_not_say),
-# is_specific_ld = !is.na(neuro_iden_specific_ld) | !is.na(neuro_diag_specific_ld),
-# is_neuro_diagnosed = !is.na(neuro_diagnosed),
-# is_asd = !is.na(neuro_iden_asd) | !is.na(neuro_diag_asd),
-# is_dyslexia = !is.na(neuro_iden_dyslexia) | !is.na(neuro_diag_dyslexia),
-# is_nvld = !is.na(neuro_iden_nvld) | !is.na(neuro_diag_nvld),
-# is_other = !is.na(neuro_iden_other) | !is.na(neuro_diag_other),
-# is_spd = !is.na(neuro_iden_spd) | !is.na(neuro_diag_spd),
-# is_tourette = !is.na(neuro_iden_tourette) | !is.na(neuro_diag_tourette),
-# # fix datetimes
-# enrollment_datetime = as_datetime(date, tz = "UTC"),
-# study_end_datetime = enrollment_datetime + days(84)
-# )
+intake_participants <- intake_participants |> 
+  mutate(
+    adhd = case_when(
+      !is.na(neuro_diag_adhd) ~ "Diagnosed ADHD",
+      is.na(neuro_diag_adhd) & !is.na(neuro_iden_adhd) ~ "Self-Identified ADHD",
+      TRUE ~ "Neurotypical"
+    )
+  )
 ```
+
 
 #### Dependents
 
@@ -1083,9 +1077,14 @@ imputed_df <- complete(imputed_output, 1)
 imputed_cols <- imputed_df |> 
   select(pid, imputed_height = height, imputed_weight = weight)
 
+intake_participants$height_original <- intake_participants$height
+intake_participants$weight_original <- intake_participants$weight
+
 intake_participants <- intake_participants |> 
   left_join(imputed_cols, by = "pid") |> 
   mutate(
+    height_imputed = if_else(is.na(height), 1, 0),
+    weight_imputed = if_else(is.na(weight), 1, 0),
     height = replace_na(imputed_height),
     weight = replace_na(imputed_weight)
   ) |> 
@@ -1100,7 +1099,7 @@ summary(intake_participants)
 #| label: qualified-demographics
 
 # TODO: finish exploring care variables
-# qual_intake$care <- qual_intake |> case_when(
+# intake_participants$care <- intake_participants |> case_when(
 #   !is.na(care_children) ~ "Yes",
 #   !is.na(care_elderly) ~ "Yes",
 #   !is.na(care_disability) ~ "Yes",
@@ -1111,14 +1110,14 @@ demographic_vars <- c(
   "country",
   "geo_area",
   "age",
-  "gender_clean",
+  "gender",
   "height",
   "weight",
-  "ethnicity_clean",
-  "edu_level_clean",
-  "employment_clean",
-  "marital_status_clean",
-  "political_party_clean",
+  "ethnicity",
+  "edu_level",
+  "employment",
+  "marital_status",
+  "political_party",
   "dependents",
   "neuro_diagnosed",
   "neuro_identify"
@@ -1129,8 +1128,8 @@ demographic_vars <- c(
 ## Descriptive Statistics
 
 ```{r}
-qual_intake |>
-  select(age, height, weight, gender_clean, ethnicity_clean, country, edu_level_clean) |>
+intake_participants |>
+  select(age, height, weight, gender, ethnicity, country, edu_level) |>
   tbl_summary(
     statistic = list(
       all_continuous() ~ "{mean} ({sd}) [{min}, {max}]",
@@ -1142,16 +1141,15 @@ qual_intake |>
   modify_header(label = "**Variable**")
 ```
 
-
 ```{r}
-table(qual_intake$gender_clean, useNA = "ifany")
-table(qual_intake$ethnicity_clean, useNA = "ifany")
-table(qual_intake$political_party_clean, useNA = "ifany")
-table(qual_intake$edu_level_clean, useNA = "ifany")
+table(intake_participants$gender, useNA = "ifany")
+table(intake_participants$ethnicity, useNA = "ifany")
+table(intake_participants$political_party, useNA = "ifany")
+table(intake_participants$edu_level, useNA = "ifany")
 
 # barplot of gender and ADHD
-qual_intake |> count(gender_clean, is_adhd) |> mutate(prop = n / sum(n)) |>
-  ggplot(aes(x = gender_clean, y = prop, fill = is_adhd)) +
+intake_participants |> count(gender, adhd) |> mutate(prop = n / sum(n)) |>
+  ggplot(aes(x = gender, y = prop, fill = adhd)) +
   geom_col(position = "dodge") +
   geom_text(
     aes(label = n),
@@ -1161,8 +1159,8 @@ qual_intake |> count(gender_clean, is_adhd) |> mutate(prop = n / sum(n)) |>
   labs(title = "Proportion of genders in qualified participants, coloured by ADHD indicator")
 
 # barplot of ethnicity and adhd (proportion of ethnicity)
-qual_intake |> count(ethnicity_clean, is_adhd) |> group_by(ethnicity_clean) |> mutate(prop = n / sum(n)) |>
-  ggplot(aes(x = ethnicity_clean, y = prop, fill = is_adhd)) +
+intake_participants |> count(ethnicity, adhd) |> group_by(ethnicity) |> mutate(prop = n / sum(n)) |>
+  ggplot(aes(x = ethnicity, y = prop, fill = adhd)) +
   geom_col(position = "dodge") +
   geom_text(
     aes(label = n),
@@ -1173,7 +1171,7 @@ qual_intake |> count(ethnicity_clean, is_adhd) |> group_by(ethnicity_clean) |> m
   labs(title = "Proportion of ethnicities in qualified participants, by ADHD indicator", y = "% of ethnic group")
 
 # barplot of video games platforms played
-qual_intake_platforms <- qual_intake |>
+intake_participants_platforms <- intake_participants |>
   select(pid, starts_with("plays")) |>
   pivot_longer(
     cols = starts_with("plays_"),
@@ -1186,16 +1184,16 @@ qual_intake_platforms <- qual_intake |>
   )
 
 # pairplot of age, height, weight coloured by gender
-qual_intake |> select(age, height, weight, gender_clean) |>
+intake_participants |> select(age, height, weight, gender) |>
   ggpairs(
-    aes(colour = gender_clean),
+    aes(colour = gender),
     columns = c("age", "height", "weight")
   )
 
 # distribution of age by gender
-ggplot(qual_intake, aes(x = age)) +
+ggplot(intake_participants, aes(x = age)) +
   geom_histogram() +
-  facet_wrap(vars(gender_clean)) +
+  facet_wrap(vars(gender)) +
   labs(
     title = "Age distribution by gender",
     x = "age",
@@ -1203,7 +1201,7 @@ ggplot(qual_intake, aes(x = age)) +
   )
 
 # distribution of platforms
-qual_intake_platforms |>
+intake_participants_platforms |>
   group_by(platform) |>
   summarise(count = sum(play)) |>
   ggplot(aes(x = fct_reorder(platform, count), y = count)) +
@@ -1212,11 +1210,11 @@ qual_intake_platforms |>
   coord_flip()
 
 # employment status (with ADHD)
-qual_intake |>
-  filter(!is.na(employment_clean)) |>
-  count(employment_clean, is_adhd) |>
-  mutate(employment_clean = fct_reorder(employment_clean, n)) |>
-  ggplot(aes(x = n, y = employment_clean, fill = is_adhd)) +
+intake_participants |>
+  filter(!is.na(employment)) |>
+  count(employment, adhd) |>
+  mutate(employment = fct_reorder(employment, n)) |>
+  ggplot(aes(x = n, y = employment, fill = adhd)) +
   geom_col() +
   labs(
     x = "Count",
@@ -1225,37 +1223,37 @@ qual_intake |>
   )
 
 # level of education
-qual_intake |>
-  count(edu_level_clean) |>
-  mutate(edu_level_clean = fct_reorder(edu_level_clean, n)) |>
-  ggplot(aes(y = edu_level_clean, x = n)) +
+intake_participants |>
+  count(edu_level) |>
+  mutate(edu_level = fct_reorder(edu_level, n)) |>
+  ggplot(aes(y = edu_level, x = n)) +
   geom_col() +
   labs(
     title = "Highest level of education of qualified participants"
   )
 
 # employment status with gender
-qual_intake |>
-  filter(!is.na(employment_clean)) |>
-  count(employment_clean, gender_clean) |>
-  mutate(employment_clean = fct_reorder(employment_clean, n)) |>
-  ggplot(aes(x = n, y = employment_clean)) +
+intake_participants |>
+  filter(!is.na(employment)) |>
+  count(employment, gender) |>
+  mutate(employment = fct_reorder(employment, n)) |>
+  ggplot(aes(x = n, y = employment)) +
   geom_col() +
   labs(
     x = "Count",
     y = "Employment status",
     title = "Employment status of qualified participants"
   ) +
-  facet_grid(rows = vars(gender_clean))
+  facet_grid(rows = vars(gender))
 
 # trends between platform and adhd
-qual_intake_platforms |>
-  left_join(qual_intake |> select(pid, gender_clean, is_adhd), by = join_by(pid)) |>
-  group_by(gender_clean, platform) |>
+intake_participants_platforms |>
+  left_join(intake_participants |> select(pid, gender, adhd), by = join_by(pid)) |>
+  group_by(gender, platform) |>
   summarise(count = sum(play), prop = count / n()) |>
   ggplot(aes(x = fct_reorder(platform, prop), y = prop)) +
   geom_col(position = position_dodge()) +
-  facet_grid(rows = vars(fct_reorder(gender_clean, prop, .desc = TRUE))) +
+  facet_grid(rows = vars(fct_reorder(gender, prop, .desc = TRUE))) +
   labs(x = "platform", y = "% of gender", title = "Proportion of gender playing games on a platform") +
   coord_flip()
 ```
@@ -1264,44 +1262,3 @@ We can see the following: a larger proportion of qualified women in the dataset 
 a third of white participants have ADHD, a quarter of multiple ethnicities have ADHD, the Asian ethnic group had the smallest proportion of people with ADHD, steam is the most popular platform to play followed by Nintendo, nearly 50% of women played on their Nintendo device compared to roughly 30% of men.
 
 Additionally, most of the qualified participants are in their 20s, working full time or unemployed.
-
-## Neurodiverse Conditions
-
-This section explores the qualified participants' neurodiverse conditions:
-```{r}
-neuro_flag_vars <- c(
-  "is_neurotypical",
-  "is_adhd",
-  "is_dyscalculia",
-  "is_dyspraxia",
-  "is_ocd",
-  "is_prefer_not_say",
-  "is_specific_ld",
-  "is_neuro_diagnosed",
-  "is_asd",
-  "is_dyslexia",
-  "is_nvld",
-  "is_other",
-  "is_spd",
-  "is_tourette"
-)
-```
-
-
-## Platforms
-```{r}
-platform_flags <- c(
-  "plays_xbox",
-  "plays_steam",
-  "plays_nintendo",
-  "plays_ios",
-  "plays_android",
-  "plays_playstation"
-)
-```
-
-
-# Context & Goals
-
-Prof. Paul Cairns is really interested in any potential differences between people with ADHD and other players.
-There are also well-being measures including a measure for depression - it could be interesting to see to what extent how people play interacts with how well they are doing more generally. 
