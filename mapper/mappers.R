@@ -32,7 +32,7 @@ create_interval_grid <- function(intervals, method = "rectangle") {
     # returns a list of length 'num_dims' containing c(min, max)
     return(box_coordinate_bounds)
   })
-  
+
   return(hyperboxes)
 }
 
@@ -73,7 +73,7 @@ create_equalised_intervals <- function(filter_values, num_intervals, percent_ove
     # Get interval length and step size as percentiles for this specific dimension
     interval_length <- 1 / ((m - 1) * (1 - overlap_frac) + 1)
     step_size <- interval_length * (1 - overlap_frac)
-    
+
     dim_intervals <- list()
     for (i in seq_len(m)) {
       # Percentile start/end for interval i
@@ -85,7 +85,7 @@ create_equalised_intervals <- function(filter_values, num_intervals, percent_ove
     }
     return(dim_intervals)
   })
-  
+
   # Construct the final hyperbox grid combinations
   interval_grid <- create_interval_grid(intervals = intervals, method = method)
   return(interval_grid)
@@ -109,8 +109,10 @@ get_points_in_interval <- function(filter_values, interval) {
 # cluster interval into graph nodes
 cluster_region <- function(points, d_matrix, clustering, ...) {
   # edge case: singleton forms its own node
-  if (length(points) == 1) return(list(points))
-  
+  if (length(points) == 1) {
+    return(list(points))
+  }
+
   # normal case: cluster data
   sub_d_matrix <- d_matrix[points, points, drop = FALSE]
   interval_clusters <- clustering(distances = sub_d_matrix, ...)
@@ -142,8 +144,10 @@ compute_graph_edges <- function(nodes) {
   adj_matrix <- matrix(0, nrow = num_nodes, ncol = num_nodes)
 
   # one node or none
-  if (num_nodes <= 1) return(adj_matrix)
-  
+  if (num_nodes <= 1) {
+    return(adj_matrix)
+  }
+
   # intersections tracked
   for (u in seq_len(num_nodes - 1)) {
     for (v in seq(u + 1, num_nodes)) {
@@ -158,8 +162,8 @@ compute_graph_edges <- function(nodes) {
 }
 
 compute_mapper <- function(
-    distances, filter_values, intervals, pruning = FALSE, min_node_size = 3, clustering, ...
-  ) {
+  distances, filter_values, intervals, pruning = FALSE, min_node_size = 3, clustering, ...
+) {
   dist_matrix <- as.matrix(distances)
   filter_values <- as.matrix(filter_values)
 
@@ -167,10 +171,9 @@ compute_mapper <- function(
   nodes <- list()
   interval_ids <- c()
   for (i in seq_along(intervals)) {
-
     interval_points <- get_points_in_interval(filter_values, intervals[[i]])
 
-    if (length(interval_points) == 0) next # skip empty hyperbox    
+    if (length(interval_points) == 0) next # skip empty hyperbox
     interval_nodes <- cluster_region(interval_points, dist_matrix, clustering, ...)
 
     # append clustering to the main tracker
@@ -194,56 +197,3 @@ compute_mapper <- function(
     interval_ids = interval_ids
   ))
 }
-
-# mapper node data
-get_node_details <- function(mapper_obj, original_data, node_id) {
-  if (node_id > mapper_obj$num_vertices || node_id < 1) {
-    stop("Invalid node_id requested")
-  }
-
-  point_indices <- mapper_obj$points_in_vertex[[node_id]]
-
-  node_data <- original_data[point_indices, ]
-  return(node_data)
-}
-
-# summary statistics of the mapper nodes
-summarise_graph <- function(mapper_obj, original_data) {
-  original_data_size <- nrow(original_data)
-  numeric_cols <- colnames(original_data)[sapply(original_data, is.numeric)]
-  categoric_cols <- setdiff(colnames(original_data), numeric_cols)
-
-  metrics <- lapply(seq_along(mapper_obj$points_in_vertex), function(node) {
-    node_data <- get_node_details(mapper_obj, original_data, node)
-    node_size <- length(mapper_obj$points_in_vertex[[node]])
-    size_pct <- round((node_size / original_data_size) * 100, 4)
-
-    node_metrics <- data.frame(
-      size = node_size,
-      size_pct = size_pct
-    )
-    if (node_size > 0) {
-      
-      if (length(numeric_cols) > 0) {
-        means <- sapply(node_data[, numeric_cols, drop = FALSE], mean, na.rm = TRUE)
-        names(means) <- paste0("mean_", numeric_cols)
-
-        medians <- sapply(node_data[, numeric_cols, drop = FALSE], median, na.rm = TRUE)
-        names(medians) <- paste0("median_", numeric_cols)
-
-        numeric_values <- cbind(as.data.frame(t(means)), as.data.frame(t(medians)))
-        node_metrics <- cbind(node_metrics, numeric_values)
-      }
-      # if (length(categoric_cols) > 0) {
-      #   modes = sapply(node_data[, categoric_cols, drop = FALSE], find_mode)
-      #   names(modes) <- paste0("mode_", categoric_cols)
-      #   categoric_values <- as.data.frame(t(modes))
-      #   node_metrics <- cbind(node_metrics, categoric_values)
-      # }
-    }
-    return(node_metrics)
-  })
-
-  return(do.call(rbind, metrics))
-}
-

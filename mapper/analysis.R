@@ -44,3 +44,53 @@ find_isolated_components <- function(mapper_obj, original_data) {
   return(node_to_component)
 }
 
+# mapper node data
+get_node_details <- function(mapper_obj, original_data, node_id) {
+  if (node_id > mapper_obj$num_vertices || node_id < 1) {
+    stop("Invalid node_id requested")
+  }
+
+  point_indices <- mapper_obj$points_in_vertex[[node_id]]
+
+  node_data <- original_data[point_indices, ]
+  return(node_data)
+}
+
+# summary statistics of the mapper nodes
+summarise_graph <- function(mapper_obj, original_data) {
+  original_data_size <- nrow(original_data)
+  numeric_cols <- colnames(original_data)[sapply(original_data, is.numeric)]
+  categoric_cols <- setdiff(colnames(original_data), numeric_cols)
+
+  metrics <- lapply(seq_along(mapper_obj$points_in_vertex), function(node) {
+    node_data <- get_node_details(mapper_obj, original_data, node)
+    node_size <- length(mapper_obj$points_in_vertex[[node]])
+    size_pct <- round((node_size / original_data_size) * 100, 4)
+
+    node_metrics <- data.frame(
+      size = node_size,
+      size_pct = size_pct
+    )
+    if (node_size > 0) {
+      if (length(numeric_cols) > 0) {
+        means <- sapply(node_data[, numeric_cols, drop = FALSE], mean, na.rm = TRUE)
+        names(means) <- paste0("mean_", numeric_cols)
+
+        medians <- sapply(node_data[, numeric_cols, drop = FALSE], median, na.rm = TRUE)
+        names(medians) <- paste0("median_", numeric_cols)
+
+        numeric_values <- cbind(as.data.frame(t(means)), as.data.frame(t(medians)))
+        node_metrics <- cbind(node_metrics, numeric_values)
+      }
+      # if (length(categoric_cols) > 0) {
+      #   modes = sapply(node_data[, categoric_cols, drop = FALSE], find_mode)
+      #   names(modes) <- paste0("mode_", categoric_cols)
+      #   categoric_values <- as.data.frame(t(modes))
+      #   node_metrics <- cbind(node_metrics, categoric_values)
+      # }
+    }
+    return(node_metrics)
+  })
+
+  return(do.call(rbind, metrics))
+}

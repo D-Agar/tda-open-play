@@ -3,6 +3,7 @@ library(fields)
 library(visNetwork)
 library(htmltools)
 library(htmlwidgets)
+source("utils.R")
 
 # construction
 create_mapper_graph <- function(
@@ -12,76 +13,104 @@ create_mapper_graph <- function(
 ) {
   # create a mapper graph, with node sizes, colours, and the option for nodes to be pie charts
   g <- graph_from_adjacency_matrix(mapper_obj$adjacency, mode = "undirected")
-  
-  # node size is the cluster size
-  node_counts <- sapply(mapper_obj$points_in_vertex, length)
 
-  colourisation <- as.matrix(colourisation)
-  # node colour is the lens value (by default)
-  # Euclidean distance magnitude from the center across dimensions
-  mean_colours <- sapply(mapper_obj$points_in_vertex, function(indices) {
-    # column averages for this specific node block
-    dim_means <- colMeans(colourisation[indices, , drop = FALSE])
-    return(sqrt(sum(dim_means^2)))
-  })
-  val_range <- max(mean_colours) - min(mean_colours)
-  
-  # avoid division by zero if all mean lens values are the same (range = 0)
-  if (val_range == 0) {
-    scaled_vals <- rep(0.5, length(mean_colours)) # no variance
+  # node size is a constant + sqrt(node size)
+  node_counts <- sapply(mapper_obj$points_in_vertex, length)
+  V(g)$size <- 2 + sqrt(node_counts)
+
+  is_colourisation_categorical <- is.character(colourisation) || is.factor(colourisation)
+
+  if (is_colourisation_categorical) {
+    colourisation <- as.factor(colourisation)
+    cat_levels <- levels(colourisation)
+
+    mode_colours <- sapply(mapper_obj$points_in_vertex, function(indices) {
+      vals <- colourisation[indices]
+      u <- unique(vals)
+      as.character(u[which.max(tabulate(match(vals, u)))])
+    })
+
+    # categoric colour palette
+    cat_palette <- hcl.colors(length(cat_levels), palette = "Set 2")
+    names(cat_palette) <- cat_levels
+    V(g)$color <- cat_palette[mode_colours]
   } else {
-    scaled_vals <- (mean_colours - min(mean_colours)) / val_range
+    # node colour is the lens value (by default)
+    colourisation <- as.matrix(colourisation)
+    # Euclidean distance magnitude from the center across dimensions
+    mean_colours <- sapply(mapper_obj$points_in_vertex, function(indices) {
+      # column averages for this specific node block
+      dim_means <- colMeans(colourisation[indices, , drop = FALSE])
+      return(sqrt(sum(dim_means^2)))
+    })
+    val_range <- max(mean_colours) - min(mean_colours)
+    # avoid division by zero if all mean lens values are the same (range = 0)
+    if (val_range == 0) {
+      scaled_vals <- rep(0.5, length(mean_colours)) # no variance
+    } else {
+      scaled_vals <- (mean_colours - min(mean_colours)) / val_range
+    }
+
+    # colour gradient from blue to yellow to red
+    colour_palette_fn <- colorRampPalette(c("blue", "yellow", "red"))
+    V(g)$color <- colour_palette_fn(100)[round(scaled_vals * 99) + 1]
   }
-  
-  # colour gradient from blue to yellow to red
-  colour_palette_fn <- colorRampPalette(c("blue", "yellow", "red"))
-  V(g)$color <- colour_palette_fn(100)[round(scaled_vals * 99) + 1]
-  
+
   # make node pie charts (optional)
   if (!is.null(groups)) {
     # groups is a list (cat_var, cat_colour)
     categories <- unique(original_data[[groups$cat_var]])
-    
+
     # proportions of each node
     pie_data <- lapply(mapper_obj$nodes, function(indices) {
       counts <- table(factor(original_data[indices, groups$cat_var], levels = categories))
       return(as.numeric(counts))
     })
-    
+
     # igraph allows list of numeric vectors for the pie attribute
     V(g)$pie <- pie_data
     V(g)$pie.color <- list(groups$cat_colour)
   }
 
-  z_limits <- c(min(colourisation), max(colourisation))
   par(mar = c(1, 1, 1, 4))
-  size <- dev.size("px")
-  V(g)$size <- log(node_counts + 1) / mapper_obj$num_vertices
-
   plot(g, layout = graph_layout(g))
+
   if (legend) {
-    legend <- setupLegend(
-      horizontal = FALSE,
-      legend.shrink = 0.5,
-      legend.width = 1.0,
-      legend.mar = 4.1
-    )
-    ticks <- seq(z_limits[1], z_limits[2], length.out = legend_tick_num)
-    addLegend(
-      legend,
-      zlim=z_limits,
-      col=colour_palette_fn(100),
-      legend.args = list(
-        text = legend_title,
-        side = 2,
-        line = 0.5
-      ),
-      # axis.args to control the tick lines
-      axis.args = list(
-        at = ticks,
-        labels = round(ticks, 2)
+    if (is_colourisation_categorical) {
+      legend(
+        "right",
+        legend = cat_levels,
+        fill = cat_palette,
+        title = legend_title,
+        xpd = TRUE,
+        bty = "n"
       )
-    )
+    } else {
+      z_limits <- c(min(colourisation), max(colourisation))
+      legend <- setupLegend(
+        horizontal = FALSE,
+        legend.shrink = 0.5,
+        legend.width = 1.0,
+        legend.mar = 4.1
+      )
+      ticks <- seq(z_limits[1], z_limits[2], length.out = legend_tick_num)
+
+      addLegend(
+        legend,
+        zlim = z_limits,
+        col = colour_palette_fn(100),
+        legend.args = list(
+          text = legend_title,
+          side = 2,
+          line = 0.5
+        ),
+        # axis.args to control the tick lines
+        axis.args = list(
+          at = ticks,
+          labels = round(ticks, 2)
+        )
+      )
+    }
   }
   return(g)
 }
@@ -95,7 +124,7 @@ add_continuous_legend <- function(
   # css gradient string
   gradient_string <- paste(colours, collapse = ", ")
   gradient_css <- sprintf("linear-gradient(to right, %s)", gradient_string)
-  
+
   # html widget to go in visualisation
   colour_bar <- tags$div(
     style = "position: absolute; top: 30px; z-index: 1000; background: rgba(255,255,255,0.9); padding: 12px; border: 1px solid #ccc; border-radius: 5px; font-family: sans-serif; box-shadow: 2px 2px 5px rgba(0,0,0,0.1);",
@@ -113,7 +142,7 @@ add_continuous_legend <- function(
       tags$span(labels[2])
     )
   )
-  
+
   # add to visualisation
   # relative positions to avoid locked legend in previews
   combined_html <- tags$div(
@@ -129,12 +158,12 @@ create_vis_graph <- function(graph, mapper_obj, original_data) {
   vis_data <- toVisNetworkData(graph)
   # numeric column names
   num_cols <- names(original_data)[sapply(original_data, is.numeric)]
-  
+
   info_strings <- sapply(1:nrow(vis_data$nodes), function(i) {
     # node index exists if mapper was pruned
     if (i <= length(mapper_obj$nodes)) {
       indices <- mapper_obj$nodes[[i]]
-      
+
       html <- paste0(
         "<div style='min-width: 150px; font-family: sans-serif;'>",
         "<h4 style='margin-top:0;'>Node ID: ",
@@ -144,7 +173,7 @@ create_vis_graph <- function(graph, mapper_obj, original_data) {
         length(indices),
         "<hr style='margin: 5px 0;'>"
       )
-      
+
       # add average of every numeric column for the cluster
       for (col in num_cols) {
         avg_val <- mean(original_data[[col]][indices], na.rm = TRUE)
@@ -156,20 +185,21 @@ create_vis_graph <- function(graph, mapper_obj, original_data) {
     }
     return(html)
   })
-  
+
   vis_data$nodes$title <- info_strings
-  
+
   # pie chart rendering (if it exists)
   if (!is.null(V(graph)$pie)) {
     # 'dot' shape keeps size and scaling constant
     vis_data$nodes$shape <- "dot"
   }
-  
+
   # build graph/network
   network <- visNetwork(vis_data$nodes,
-                        vis_data$edges,
-                        width = "100%",
-                        height = "800px") |>
+    vis_data$edges,
+    width = "100%",
+    height = "800px"
+  ) |>
     visNodes(
       borderWidth = 2,
       borderWidthSelected = 4,
