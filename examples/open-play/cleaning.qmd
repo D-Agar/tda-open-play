@@ -65,6 +65,7 @@ library(VIM)
 library(mice)
 library(ggmice)
 library(car)
+library(skimr)
 
 theme_set(theme_minimal())
 source("examples/open-play/helpers.R")
@@ -82,9 +83,9 @@ nintendo <- read_csv("data/open-play/clean/nintendo.csv.gz")
 simon <- read_csv("data/open-play/clean/simon.csv.gz")
 steam <- read_csv("data/open-play/clean/steam.csv.gz")
 steam_visibility <- read_csv("data/open-play/raw/telemetry_steam_account_linking_raw.csv.gz")
-biweekly <- read_csv("data/open-play/clean/biweekly.csv.gz")
-daily <- read_csv("data/open-play/clean/daily.csv.gz", guess_max = 10000)
-intake <- read_csv("data/open-play/clean/intake.csv.gz", guess_max = 34000)
+biweekly <- read_csv("data/open-play/clean/survey_biweekly.csv.gz")
+daily <- read_csv("data/open-play/clean/survey_daily.csv.gz", guess_max = 10000)
+intake <- read_csv("data/open-play/clean/survey_intake.csv.gz", guess_max = 34000)
 time_use <- read_csv("data/open-play/clean/timeuse.csv.gz") |>
   filter(quality_flag == "Good quality")
 xbox <- read_csv("data/open-play/clean/xbox.csv.gz")
@@ -930,7 +931,7 @@ outlying_height_weight <- intake_participants |>
 
 
 I can try impute these, or simply leave them in the binary missingness indicator.
-The data is missing at an item-level - 
+The data is missing at an item-level.
 
 ```{r}
 missing_weight <- intake_participants |> filter(is.na(weight))
@@ -1093,172 +1094,164 @@ intake_participants <- intake_participants |>
 summary(intake_participants)
 ```
 
-## Exploring the demographics
+# Daily Surveys
 
+```{r} 
+daily |>
+  mutate(across(where(is.character), as.factor)) |>
+  skim() |>
+  print()
+```
+The `stress_events_health` and `stress_events_other` appear to be swapped.
+I must check if the number of responses match up to see if the `how_stress` variables are also swapped
+```{r} 
+addmargins(xtabs(~ stress_events_health + how_stressful_health, data = daily, addNA = TRUE))
+addmargins(xtabs(~ stress_events_health + how_stressful_other, data = daily, addNA = TRUE))
+
+addmargins(xtabs(~ stress_events_other + how_stressful_health, data = daily, addNA = TRUE))
+addmargins(xtabs(~ stress_events_other + how_stressful_other, data = daily, addNA = TRUE))
+```
+We can see that when the indicator for health is NA, there are still responses for the level of stress, where there shouldn't be.
+This is confirmed by forming the cross-tab with `how_stressful_other`, where there are no responeses when health is NA.
+We will therefore swap these:
 ```{r}
-#| label: qualified-demographics
+real_stress_health <- daily$stress_events_other
+real_how_stress_health <- daily$how_stressful_other
 
-# TODO: finish exploring care variables
-# intake_participants$care <- intake_participants |> case_when(
-#   !is.na(care_children) ~ "Yes",
-#   !is.na(care_elderly) ~ "Yes",
-#   !is.na(care_disability) ~ "Yes",
-#   !is.na(care_other) ~ ""
-# )
+daily_cleaned <- daily |>
+  mutate(
+    stress_events_other = stress_events_health,
+    how_stressful_other = how_stressful_health,
+    stress_events_health = real_stress_health,
+    how_stressful_health = real_how_stress_health
+  )
 
-demographic_vars <- c(
-  "country",
-  "geo_area",
-  "age",
-  "gender",
-  "height",
-  "weight",
-  "ethnicity",
-  "edu_level",
-  "employment",
-  "marital_status",
-  "political_party",
-  "dependents",
-  "neuro_diagnosed",
-  "neuro_identify"
+addmargins(xtabs(~ stress_events_health + how_stressful_health, data = daily_cleaned, addNA = TRUE))
+addmargins(xtabs(~ stress_events_health + how_stressful_other, data = daily_cleaned, addNA = TRUE))
+
+addmargins(xtabs(~ stress_events_other + how_stressful_health, data = daily_cleaned, addNA = TRUE))
+addmargins(xtabs(~ stress_events_other + how_stressful_other, data = daily_cleaned, addNA = TRUE))
+```
+
+# Biweekly Surveys
+
+```{r} 
+biweekly |>
+  mutate(across(where(is.character), as.factor)) |>
+  skim() |>
+  print()
+
+skim(biweekly, starts_with("bfi_2"))
+```
+All of the `bfi` variables are missing.
+The `gaming_value` variables are ranged -3 to 3, whereas the codebook says 1-7.
+I will recode in accordance with the codebook.
+```{r} 
+biweekly_cleaned <- biweekly |>
+  # -3 to 3 -> 1-7
+  mutate(across(starts_with("gaming_value"), function(col) col + 4))
+
+biweekly_cleaned |>
+  mutate(across(where(is.character), as.factor)) |>
+  skim() |>
+  print()
+```
+
+There is also a -300 in `recent_session1_duration_min`, which cannot be negative.
+```{r}
+ggplot(biweekly_cleaned, aes(y = recent_session3_duration_min)) +
+  geom_boxplot()
+
+biweekly_cleaned |>
+  filter(recent_session3_duration_min >= 180) |> # Q3
+  pull(recent_session3_duration_min) |>
+  skim()
+
+# only one participant
+wrong_session3 <- biweekly_cleaned |>
+  filter(recent_session3_duration_min < 0)
+
+biweekly_cleaned |>
+  filter(pid == wrong_session3$pid) |>
+  pull(recent_session3_duration_min) |>
+  skim()
+```
+
+Looking at the participant's and the cohort's distribution of this variable's values,
+this is within the range (max is 1700, in 93.75 percentile).
+I will simply make the value positive
+```{r} 
+biweekly_cleaned <- biweekly_cleaned |>
+  mutate(recent_session3_duration_min = abs(recent_session3_duration_min))
+```
+
+# Video Game Telemetry
+
+## Android
+```{r}
+skim(android)
+```
+Nothing unusual here.
+
+## iOS
+```{r}
+skim(ios)
+```
+Same here
+
+## Xbox
+I will work with the `xbox_valid_sessions` as it continues from Ballou's work.
+```{r}
+skim(xbox |> mutate(across(where(is.character), as.factor)))
+```
+
+## Steam
+```{r}
+skim(steam |> mutate(across(where(is.character), as.factor)))
+```
+
+## Metadata
+```{r}
+skim(metadata |> mutate(across(where(is.character), as.factor)))
+```
+
+## Nintendo
+```{r}
+skim(nintendo |> mutate(across(where(is.character), as.factor)))
+```
+
+# Attention (Simon)
+```{r}
+skim(simon |> mutate(across(where(is.character), as.factor)))
+
+ggplot(simon, aes(x = score_final)) +
+  geom_histogram()
+
+negative_simon_score <- simon |>
+  filter(score_final < 0)
+```
+A negative score is allowed as a participant gains one point for each correct response,
+and lose a point for every incorrect response.
+
+# Timeuse
+```{r}
+skim(time_use |> mutate(across(where(is.character), as.factor)))
+```
+`activity_other` is not missing when the activity recorded in the time use is 'other'.
+
+# Writing the Data
+Data to write: survey_intake, survey_daily, survey_biweekly.
+```{r} 
+write_csv(
+  intake_participants,
+  file = "data/open-play/clean/survey_intake_participants_final.csv.gz"
+)
+write_csv(
+  daily_cleaned,
+  file = "data/open-play/clean/survey_daily_final.csv.gz"
+)
+write_csv(
+  biweekly_cleaned,
+  file = "data/open-play/clean/survey_biweekly_final.csv.gz"
 )
 ```
-
-
-## Descriptive Statistics
-
-```{r}
-intake_participants |>
-  select(age, height, weight, gender, ethnicity, country, edu_level) |>
-  tbl_summary(
-    statistic = list(
-      all_continuous() ~ "{mean} ({sd}) [{min}, {max}]",
-      all_categorical() ~ "{n} / {N} ({p}%)"
-    ),
-    missing = "ifany"
-  ) |>
-  bold_labels() |>
-  modify_header(label = "**Variable**")
-```
-
-```{r}
-table(intake_participants$gender, useNA = "ifany")
-table(intake_participants$ethnicity, useNA = "ifany")
-table(intake_participants$political_party, useNA = "ifany")
-table(intake_participants$edu_level, useNA = "ifany")
-
-# barplot of gender and ADHD
-intake_participants |> count(gender, adhd) |> mutate(prop = n / sum(n)) |>
-  ggplot(aes(x = gender, y = prop, fill = adhd)) +
-  geom_col(position = "dodge") +
-  geom_text(
-    aes(label = n),
-    position = position_dodge(width = 0.9),
-    vjust = -0.5
-  ) +
-  labs(title = "Proportion of genders in qualified participants, coloured by ADHD indicator")
-
-# barplot of ethnicity and adhd (proportion of ethnicity)
-intake_participants |> count(ethnicity, adhd) |> group_by(ethnicity) |> mutate(prop = n / sum(n)) |>
-  ggplot(aes(x = ethnicity, y = prop, fill = adhd)) +
-  geom_col(position = "dodge") +
-  geom_text(
-    aes(label = n),
-    position = position_dodge(width = 1),
-    hjust = -0.5
-  ) +
-  coord_flip() +
-  labs(title = "Proportion of ethnicities in qualified participants, by ADHD indicator", y = "% of ethnic group")
-
-# barplot of video games platforms played
-intake_participants_platforms <- intake_participants |>
-  select(pid, starts_with("plays")) |>
-  pivot_longer(
-    cols = starts_with("plays_"),
-    names_to = "platform",
-    values_to = "play"
-  ) |>
-  mutate(
-    play = as.integer(play),
-    platform = str_replace(platform, "plays_", "")
-  )
-
-# pairplot of age, height, weight coloured by gender
-intake_participants |> select(age, height, weight, gender) |>
-  ggpairs(
-    aes(colour = gender),
-    columns = c("age", "height", "weight")
-  )
-
-# distribution of age by gender
-ggplot(intake_participants, aes(x = age)) +
-  geom_histogram() +
-  facet_wrap(vars(gender)) +
-  labs(
-    title = "Age distribution by gender",
-    x = "age",
-    y = "density",
-  )
-
-# distribution of platforms
-intake_participants_platforms |>
-  group_by(platform) |>
-  summarise(count = sum(play)) |>
-  ggplot(aes(x = fct_reorder(platform, count), y = count)) +
-  geom_col() +
-  labs(title = "Platform Frequency of qualified participants") +
-  coord_flip()
-
-# employment status (with ADHD)
-intake_participants |>
-  filter(!is.na(employment)) |>
-  count(employment, adhd) |>
-  mutate(employment = fct_reorder(employment, n)) |>
-  ggplot(aes(x = n, y = employment, fill = adhd)) +
-  geom_col() +
-  labs(
-    x = "Count",
-    y = "Employment status",
-    title = "Employment status of qualified participants"
-  )
-
-# level of education
-intake_participants |>
-  count(edu_level) |>
-  mutate(edu_level = fct_reorder(edu_level, n)) |>
-  ggplot(aes(y = edu_level, x = n)) +
-  geom_col() +
-  labs(
-    title = "Highest level of education of qualified participants"
-  )
-
-# employment status with gender
-intake_participants |>
-  filter(!is.na(employment)) |>
-  count(employment, gender) |>
-  mutate(employment = fct_reorder(employment, n)) |>
-  ggplot(aes(x = n, y = employment)) +
-  geom_col() +
-  labs(
-    x = "Count",
-    y = "Employment status",
-    title = "Employment status of qualified participants"
-  ) +
-  facet_grid(rows = vars(gender))
-
-# trends between platform and adhd
-intake_participants_platforms |>
-  left_join(intake_participants |> select(pid, gender, adhd), by = join_by(pid)) |>
-  group_by(gender, platform) |>
-  summarise(count = sum(play), prop = count / n()) |>
-  ggplot(aes(x = fct_reorder(platform, prop), y = prop)) +
-  geom_col(position = position_dodge()) +
-  facet_grid(rows = vars(fct_reorder(gender, prop, .desc = TRUE))) +
-  labs(x = "platform", y = "% of gender", title = "Proportion of gender playing games on a platform") +
-  coord_flip()
-```
-
-We can see the following: a larger proportion of qualified women in the dataset have ADHD compared to men,
-a third of white participants have ADHD, a quarter of multiple ethnicities have ADHD, the Asian ethnic group had the smallest proportion of people with ADHD, steam is the most popular platform to play followed by Nintendo, nearly 50% of women played on their Nintendo device compared to roughly 30% of men.
-
-Additionally, most of the qualified participants are in their 20s, working full time or unemployed.

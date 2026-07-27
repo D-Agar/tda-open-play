@@ -229,7 +229,8 @@ This follows on from `cleaning.qmd`, where I focused on understanding the partic
 Here, I begin to understand the data, gaining more deeper insights and exploring the telemetry data of the qualified participants.
 
 Prof. Paul Cairns is really interested in any potential differences between people with ADHD and other players.
-There are also well-being measures including a measure for depression - it could be interesting to see to what extent how people play interacts with how well they are doing more generally.
+There are also well-being measures including a measure for depression -
+it could be interesting to see to what extent how people play interacts with how well they are doing more generally.
 
 # Demographics
 
@@ -267,6 +268,24 @@ intake_participants |>
   select(all_of(setdiff(demographic_vars, c("pid", "geo_area")))) |>
   mutate(across(where(is.character), as.factor)) |> 
   skim() |> print()
+
+# timeline of no. participants acquired
+intake_participants |>
+  mutate(
+    date = lubridate::as_date(date),
+    day = day(date),
+    month = month(date),
+    year = year(date)
+  ) |>
+  count(date) |>
+  ggplot(aes(x = date, y = n)) +
+  geom_point() +
+  geom_line() +
+  scale_x_date(
+    breaks = scales::breaks_pretty(n = 12),
+    labels = scales::label_date_short()
+  ) +
+  labs(title = "No. participants acquired")
 ```
 
 
@@ -1317,6 +1336,8 @@ Overall these appear to show positive experiences whilst playing video games, in
 ### BPNSFS
 
 ```{r}
+table(daily_participants$bpnsfs_failed_att_check)
+
 daily_participants |>
   pivot_longer(
     cols = c("bpnsfs_1", "bpnsfs_2", "bpnsfs_3", "bpnsfs_4", "bpnsfs_5", "bpnsfs_6"),
@@ -1326,6 +1347,16 @@ daily_participants |>
   ggplot(aes(x = value)) +
   geom_histogram(bins=5) +
   facet_wrap(~bpnsfs) +
+  labs(title = "Daily participants' BPNSFS scores")
+
+daily_participants |>
+  pivot_longer(
+    cols = c("bpnsfs_1", "bpnsfs_2", "bpnsfs_3", "bpnsfs_4", "bpnsfs_5", "bpnsfs_6"),
+    names_to = "bpnsfs",
+    values_to = "value"
+  ) |> 
+  ggplot(aes(x = bpnsfs, y = value)) +
+  geom_boxplot() +
   labs(title = "Daily participants' BPNSFS scores")
 
 # variable recoding again
@@ -1350,6 +1381,7 @@ daily_participants |>
   count() |>
   arrange(-n)
 ```
+
 We see clear patterns of positive well-being and life satisfaction.
 I will now check the correlations to get an idea of participant's experiences:
 ```{r}
@@ -1364,7 +1396,8 @@ daily_participants |>
   select(all_of(daily_bpnsfs_cols)) |>
   cor(method = "spearman", use = "pairwise.complete.obs")
 ```
-We see a similar pattern again.
+We see a similar pattern again,
+particularly strong correlations between bpnsfs_1 and the other positive scales (3 and 5).
 
 ### Stress
 
@@ -1372,6 +1405,22 @@ First, I am looking at the general stress levels of all responses of participant
 ```{r}
 table(daily_participants$had_stress)
 
+daily_stress_responses <- daily_participants |>
+  filter(had_stress == "Yes")
+
+table(daily_stress_responses$stress_events_argument, useNA = "ifany")
+table(daily_stress_responses$stress_events_discrimination, useNA = "ifany")
+table(daily_stress_responses$stress_events_friend_rel, useNA = "ifany")
+table(daily_stress_responses$stress_events_health, useNA = "ifany")
+table(daily_stress_responses$stress_events_home, useNA = "ifany")
+table(daily_stress_responses$stress_events_other, useNA = "ifany")
+```
+Note that the `stress_events_health` and `stress_events_other` appear to be swapped in the dataset.
+```{r}
+daily
+```
+
+```{r}
 # % of people who said yes more than once
 multiple_stress_pid <- daily_participants |>
   count(pid, had_stress) |>
