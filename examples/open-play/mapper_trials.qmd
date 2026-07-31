@@ -8,3 +8,1653 @@ format:
     toc: true
   docx: default
 ---
+
+```{r}
+#| label: libraries
+#| include: false
+#| code-summary: "Show code (Load required R packages)"
+library(tidyverse)
+library(data.table)
+library(dtplyr)
+library(skimr)
+library(stringr)
+library(MapperAlgo)
+library(jsonlite)
+library(dbscan)
+library(patchwork)
+library(tidymodels)
+# library(uwot)
+library(rpart.plot)
+library(probably)
+library(Rtsne)
+library(GGally)
+library(isotree)
+library(MLmetrics)
+
+theme_set(theme_minimal())
+source("examples/open-play/helpers.R")
+source("utils.R")
+
+sourceDir("mapper", exclude = "test.R")
+```
+
+```{r}
+#| label: data setup
+#| include: false
+#| cache: true
+#| output: false
+
+android <- read_csv("data/open-play/clean/android.csv.gz")
+metadata <- read_csv("data/open-play/clean/game_metadata.csv.gz")
+ios <- read_csv("data/open-play/clean/ios.csv.gz")
+nintendo <- read_csv("data/open-play/clean/nintendo.csv.gz")
+simon <- read_csv("data/open-play/clean/simon.csv.gz")
+steam <- read_csv("data/open-play/clean/steam.csv.gz")
+steam_visibility <- read_csv(
+  "data/open-play/raw/telemetry_steam_account_linking_raw.csv.gz"
+)
+biweekly <- read_csv("data/open-play/clean/survey_biweekly_final.csv.gz")
+daily <- read_csv("data/open-play/clean/survey_daily_final.csv.gz", guess_max = 10000)
+intake_participants <- read_csv("data/open-play/clean/survey_intake_participants_final.csv.gz", guess_max = 34000)
+participant_coords <- read_csv("data/open-play/clean/participant_coords.csv.gz")
+time_use <- read_csv("data/open-play/clean/timeuse.csv.gz") |>
+  filter(quality_flag == "Good quality")
+xbox <- read_csv("data/open-play/clean/xbox.csv.gz")
+```
+
+# Getting the Data Mapper Ready
+I need to bare in mind that for this to work with the telemetry data,
+I should either cut the telemetry data prior to surveys,
+or have a variable to indicate how much they played on average beforehand.
+
+Any transformation possibly needed:
+- pid: post-mapper analysis
+- demographic variables: require some form of encoding/scaling
+- day of study: this will be useful for a temporal tracking (true dates are irrattic)
+- location: convert country and geo_area into coordinates
+
+```{r}
+#| label: data-prep
+#| cache: true
+#| include: false
+
+# turning country and geo code into long/lat for mapper
+# these are the centroids of the combined addresses
+# participant_coords <- intake_participants |>
+#   select(country, geo_area) |>
+#   distinct() |>
+#   mutate(address = paste(geo_area, country, sep = ", ")) |>
+#   geocode(address = address) |>
+#   select(-address)
+
+# write_csv(participant_coords, file = "data/open-play/clean/participant_coords.csv.gz")
+
+# merge with the local time zone offsets from intake participants
+# Note: We keep country and local_timezone for DST-aware conversion
+tz_map <- intake_participants |>
+  mutate(
+    pid,
+    country,
+    local_timezone,
+    .keep = "none"
+  ) |>
+  distinct(pid, .keep_all = TRUE)
+
+# aggregate data at each level of granularity (session, hourly, daily)
+# session level (Nintendo, Xbox, Steam already at session level)
+session_telemetry <- bind_rows(
+  xbox |> mutate(platform = "Xbox"),
+  nintendo |> mutate(platform = "Nintendo"),
+) |>
+  left_join(tz_map, by = "pid") |>
+  filter(!is.na(local_timezone)) |>
+  mutate(
+    # Calculate DST-aware offset for each timestamp
+    offset_start = get_dst_offset(session_start, country, local_timezone),
+    offset_end = get_dst_offset(session_end, country, local_timezone),
+    # Add offset to get local time values (keeping UTC label for compatibility)
+    start_local = session_start + offset_start,
+    end_local = session_end + offset_end,
+    duration_min = as.numeric(difftime(
+      session_end,
+      session_start,
+      units = "mins"
+    ))
+  ) |>
+  filter(
+    !is.na(session_start),
+    !is.na(session_end),
+    session_end > session_start,
+    duration_min >= 1
+  )
+
+# Hourly from sessions (Nintendo + Xbox)
+# Join with timezone map and calculate DST-aware offsets
+# Note: start_local/end_local have UTC labels but local time VALUES (for hour extraction)
+sessions_telemetry <- bind_rows(
+  xbox |> mutate(platform = "Xbox"),
+  nintendo |> mutate(platform = "Nintendo")
+) |>
+  mutate(pid = as.character(pid)) |>
+  left_join(tz_map, by = "pid") |>
+  filter(!is.na(local_timezone)) |>
+  mutate(
+    # Calculate DST-aware offset for each timestamp
+    offset_start = get_dst_offset(session_start, country, local_timezone),
+    offset_end = get_dst_offset(session_end, country, local_timezone),
+    # Add offset to get local time values (keeping UTC label for compatibility)
+    start_local = session_start + offset_start,
+    end_local = session_end + offset_end,
+    duration_min = as.numeric(difftime(
+      session_end,
+      session_start,
+      units = "mins"
+    ))
+  ) |>
+  filter(
+    !is.na(session_start),
+    !is.na(session_end),
+    session_end > session_start,
+    duration_min >= 1
+  )
+
+hourly_from_sessions <- sessions_telemetry |>
+  filter(!is.na(start_local), !is.na(end_local)) |>
+  mutate(
+    h0_local = floor_date(start_local, "hour"),
+    h1_local = floor_date(end_local - seconds(1), "hour"),
+    n_hours = as.integer(difftime(h1_local, h0_local, units = "hours")) + 1
+  ) |>
+  filter(!is.na(n_hours), n_hours > 0) |>
+  tidyr::uncount(n_hours, .remove = FALSE, .id = "k") |>
+  mutate(
+    hour_start_local = h0_local + hours(k - 1),
+    minutes = pmax(
+      0,
+      as.numeric(difftime(
+        pmin(end_local, hour_start_local + hours(1)),
+        pmax(start_local, hour_start_local),
+        units = "mins"
+      ))
+    ),
+    # Convert back to UTC (this preserves the instant, just changes label)
+    hour_start_utc = with_tz(hour_start_local, tzone = "UTC")
+  ) |>
+  select(pid, platform, hour_start_local, hour_start_utc, minutes)
+
+# --- Hourly from Steam (already hourly) -------------------------------------
+hourly_from_steam <- steam |>
+  select(pid, datetime_hour_start, minutes) |>
+  mutate(pid = as.character(pid)) |>
+  left_join(tz_map, by = "pid") |>
+  filter(!is.na(local_timezone)) |>
+  mutate(
+    platform = "Steam",
+    hour_start_utc = datetime_hour_start,
+    # Calculate DST-aware offset and add to get local time values
+    offset = get_dst_offset(datetime_hour_start, country, local_timezone),
+    hour_start_local = datetime_hour_start + offset
+  ) |>
+  select(pid, platform, hour_start_local, hour_start_utc, minutes)
+
+hourly_telemetry <- bind_rows(hourly_from_sessions, hourly_from_steam)
+
+# Daily (Nintendo + Xbox + Steam; collapse hourly to days)
+daily_telemetry <- hourly_telemetry |>
+  mutate(
+    day_local = as.Date(hour_start_local),
+  ) |>
+  group_by(pid, platform, day_local) |>
+  summarise(minutes = sum(minutes, na.rm = TRUE), .groups = "drop") |>
+  bind_rows(ios) |>
+  bind_rows(android)
+
+daily_ios_android <- bind_rows(
+  ios |>
+    transmute(
+      pid = as.character(pid),
+      platform = "iOS",
+      day_local = as.Date(day_local),
+      minutes
+    ),
+  android |>
+    transmute(
+      pid = as.character(pid),
+      platform = "Android",
+      day_local = as.Date(day_local),
+      minutes
+    )
+)
+
+daily_all <- bind_rows(daily_telemetry, daily_ios_android) |>
+  group_by(pid, day_local) |>
+  summarise(total_minutes = sum(minutes, na.rm = TRUE), .groups = "drop")
+
+# Weekly
+weekly_all <- daily_telemetry |>
+  mutate(
+    week = floor_date(day_local, "week")
+  ) |>
+  group_by(pid, platform, week) |>
+  summarise(minutes = sum(minutes, na.rm = TRUE), .groups = "drop")
+
+telemetry_spans <- daily_telemetry |>
+  group_by(pid, platform) |>
+  summarise(
+    telemetry_start = min(day_local, na.rm = TRUE),
+    # end of last hour bin
+    telemetry_end = max(day_local, na.rm = TRUE) + hours(1),
+    week = floor_date(telemetry_end, "week"),
+    n_weeks = as.integer(difftime(
+      telemetry_end,
+      telemetry_start,
+      units = "weeks"
+    )) +
+      1,
+    .groups = "drop"
+  )
+```
+
+```{r}
+demographic_vars <- c(
+  "pid",
+  "country",
+  "geo_area",
+  "gender",
+  "height",
+  "weight",
+  "age",
+  "ethnicity",
+  "edu_level",
+  "employment",
+  "political_party",
+  "marital_status",
+  "adhd"
+)
+```
+
+# Mapper Tests
+
+Here are some mapper configurations I want to run:
+- Include categorical data with Gower Distance
+- Telemetry data only (study date, play time per platform)
+- Well-being data only
+- Telemetry and well-being data
+
+## Telemetry data
+For this experiment, I will use the telemetry data as the basis of the filter function.
+The reason for this is that we can explore gaming patterns to find any clusters/groupings (ADHD related telemetry).
+This can be followed up with well-being overlays.
+
+Based on literature, I will try with PCA.
+We will have a row for each day of the survey for each participant.
+Each row will have: minutes played for each platform, day of the study.
+
+```{r}
+# creates exhaustive entry list for all 12 weeks from the start date
+# if there are no entries for a date, create a new row with 0 for each platform playtime
+
+platforms <- c("Steam", "Nintendo", "Xbox", "Android", "iOS")
+
+# study lasts 12 weeks
+# start at 0 for first day
+study_duration_days <- 83
+
+daily_start_dates <- daily |>
+  group_by(pid) |>
+  mutate(first_wave = min(wave)) |>
+  ungroup() |>
+  filter(wave == first_wave) |>
+  select(pid, daily_start_date = date, first_wave)
+
+biweekly_start_dates <- biweekly |>
+  group_by(pid) |>
+  mutate(first_wave = min(wave)) |>
+  ungroup() |>
+  filter(wave == first_wave) |>
+  select(pid, biweekly_start_date = date, first_wave)
+
+survey_start_dates <- biweekly_start_dates |>
+  full_join(daily_start_dates, by = join_by(pid)) |>
+  mutate(started_study = as.Date(pmin(biweekly_start_date, daily_start_date, na.rm = TRUE))) |>
+  select(pid, started_study)
+
+last_daily_survey <- daily |>
+  group_by(pid) |>
+  summarise(last_daily_survey = max(date, na.rm = TRUE))
+
+last_biweekly_survey <- biweekly |>
+  group_by(pid) |>
+  summarise(last_biweekly_survey = max(date, na.rm = TRUE))
+
+last_daily_telemetry <- daily_telemetry |>
+  group_by(pid) |>
+  summarise(last_ping = max(day_local, na.rm = TRUE))
+
+participant_windows <- survey_start_dates |>
+  left_join(last_daily_survey, by = "pid") |>
+  left_join(last_biweekly_survey, by = "pid") |>
+  left_join(last_daily_telemetry, by = "pid") |>
+  mutate(
+    last_survey_date = pmax(last_daily_survey, last_biweekly_survey, na.rm = TRUE),
+    active_study_days = as.numeric(difftime(last_survey_date, started_study, units = "days")) + 1,
+    active_study_days = pmin(active_study_days, study_duration_days)
+  )
+
+# participant timelines dynamically creating rows up till the last day of participation
+study_timeline <- participant_windows |>
+  filter(!is.na(active_study_days)) |> # drop pid with zero usable dates
+  mutate(study_day_offset = map(active_study_days, ~0:(.x - 1))) |>
+  unnest(study_day_offset) |>
+  mutate(day_local = started_study + study_day_offset) |>
+  select(pid, started_study, last_survey_date, active_study_days, day_local, study_day_offset)
+
+wide_daily_telemetry <- daily_telemetry |>
+  distinct(pid, platform, day_local, .keep_all = TRUE) |>
+  pivot_wider(
+    names_from = platform,
+    names_glue = "{platform}_minutes",
+    values_from = minutes,
+    values_fill = 0
+  ) |>
+  rename_with(tolower)
+
+complete_daily_telemetry <- study_timeline |>
+  left_join(wide_daily_telemetry, by = join_by(pid, day_local)) |>
+  mutate(
+    across(ends_with("_minutes"), ~replace_na(.x, 0)),
+    day_of_week = wday(day_local)
+  )
+
+telemetry_traits <- complete_daily_telemetry |>
+  group_by(pid, active_study_days) |>
+  summarise(
+    # activity stats
+    mean_daily_steam_minutes = sum(steam_minutes, na.rm = TRUE) /
+      first(active_study_days),
+    mean_daily_nintendo_minutes = sum(nintendo_minutes, na.rm = TRUE) /
+      first(active_study_days),
+    mean_daily_xbox_minutes = sum(xbox_minutes, na.rm = TRUE) /
+      first(active_study_days),
+    mean_daily_mobile_minutes = sum(ios_minutes + android_minutes, na.rm = TRUE) /
+      first(active_study_days),
+    mean_daily_total = sum(
+      steam_minutes + nintendo_minutes + xbox_minutes +
+        ios_minutes + android_minutes, na.rm = TRUE
+    ) / first(active_study_days),
+
+    max_binge_day = max(steam_minutes + nintendo_minutes + xbox_minutes + ios_minutes + android_minutes, na.rm = TRUE),
+
+    # gaming traits
+    active_gaming_ratio = mean((steam_minutes + nintendo_minutes + xbox_minutes + ios_minutes + android_minutes) > 0),
+    .groups = "drop_last"
+  ) |>
+  ungroup()
+
+interested_deomographic_cols <- c(
+  "adhd",
+  "country", "long", "lat",
+  "age", "gender", "ethnicity", "height", "weight",
+  "edu_level", "employment", "marital_status"
+)
+telem_traits_dem <- intake_participants |>
+  left_join(participant_coords, by = join_by(country, geo_area)) |>
+  select(all_of(c("pid", interested_deomographic_cols))) |>
+  right_join(telemetry_traits, by = "pid") |>
+  drop_na()
+
+# old: add to mapper data
+tel_dem_data_full <- intake_participants |>
+  left_join(participant_coords, by = join_by(country, geo_area)) |>
+  left_join(complete_daily_telemetry, by = join_by(pid))
+```
+
+### Old: combinations of telemetry
+I will choose the variables.
+Given that there are lots of variables, I cannot just use an identity filter function.
+Therefore, PCA may be more appropriate here
+```{r}
+continuous_demographic_cols <- c("age", "height", "weight", "long", "lat")
+categoric_game_cols <- c("plays_xbox", "plays_steam", "plays_nintendo", "plays_ios", "plays_android")
+study_cols <- c("study_day_offset")
+telemetry_cols  <- c(
+  "steam_minutes",
+  "nintendo_minutes",
+  "xbox_minutes",
+  "ios_minutes",
+  "android_minutes"
+)
+
+tel_dem_data_mapper <- tel_dem_data_full |>
+  select(all_of(c(continuous_demographic_cols, study_cols, telemetry_cols)))
+
+# filter function: first two principal components
+tel_dem_pca <- prcomp(tel_dem_data_mapper, scale. = TRUE)
+tel_dem_filter_fn <- tel_dem_pca$rotation[, 1:2]
+summary(tel_dem_pca)
+
+# ggplot(tel_dem_pca$x, aes(x = PC1, y = PC2, colour = tel_dem_data_full$adhd)) +
+#   geom_point()
+```
+PCA fails to capture enough of the variance to warrant its use as a filter function.
+I will try UMAP:
+```{r}
+set.seed(30)
+# tel_dem_umap <- umap2(
+#   tel_dem_data_mapper,
+#   n_components = 2,
+#   scale = TRUE,
+#   n_neighbors = 15, # default
+#   min_dist = 0.1 # default
+# )
+```
+
+I found we had a lot of days not being played (found in the distributions).
+Instead, I will just do descriptive statistics for each participant during the study.
+
+### Participant-based Telemetry
+Here, due to the small amount of data when summarised, I will trial different filter functions.
+
+#### PCA
+
+```{r}
+n_components <- 2
+
+# data scaling
+telem_traits_scaled <- telem_traits_dem |>
+  select(starts_with("mean_daily"), active_gaming_ratio, max_binge_day) |>
+  # scale by dividing by standard deviation
+  mutate(across(everything(), ~scale(.)[,1]))
+
+telem_traits_pca <- prcomp(telem_traits_scaled)
+summary(telem_traits_pca)
+
+telem_trailts_dist <- dist(telem_traits_scaled, method = "euclidean")
+telem_traits_filter <- telem_traits_pca$x[, 1:n_components]
+```
+
+##### Mapper Parameter Grid Search
+```{r}
+telem_traits_mapper_search_time <- system.time({
+  telem_traits_mapper_search <- GridSearch(
+    original_data = telem_traits_scaled,
+    filter_values = telem_traits_filter,
+    label = telem_traits_dem$adhd,
+    column = "ADHD",
+    cover_type = "stride",
+    width_vec = c(0.5, 1, 1.5),
+    overlap_vec = c(50),
+    num_cores = 12,
+    out_dir = "examples/open-play/telem_traits_mapper_grid"
+  )
+})
+```
+Now I need to find good values for DBSCAN.
+The rule of thumb for `minPts` is either 2x the dimensions, or +1.
+For `eps`, a k-distance graph showing the distance to each k-th neighbour for every point.
+With this, I am looking for a value near the 'elbow'.
+
+```{r}
+# rules of thumb for dbscan:
+# minPts: >= d + 1, 2 x d
+# eps: kNN distance graph to find elbow
+k_val <- ncol(telem_traits_scaled) + 1
+kNNdistplot(telem_traits_scaled, k = k_val)
+```
+This shows a value between 1.5 and 1.8 will split majority of the data and isolate the outliers.
+For a more localised graph, I could use a smaller value (~1/1.2).
+
+```{r}
+# best so far was 20 intervals, 1.4 eps
+telem_traits_mapper <- MapperAlgo(
+  original_data = telem_traits_scaled,
+  filter_values = telem_traits_filter,
+  percent_overlap = 50,
+  methods = "dbscan",
+  method_params = list(eps = 1.5, minPts = 9),
+  cover_type = "stride",
+  intervals = 10,
+  num_cores = 12
+)
+
+# save the file in the 'mappers' directory
+export_data <- list(
+  adjacency = telem_traits_mapper$adjacency,
+  num_vertices = telem_traits_mapper$num_vertices,
+  level_of_vertex = telem_traits_mapper$level_of_vertex,
+  points_in_vertex = telem_traits_mapper$points_in_vertex,
+  original_data = telem_traits_dem
+)
+
+mapper_trials_dir <- file.path("examples", "open-play", "mappers")
+if (!dir.exists(mapper_trials_dir)) {
+  dir.create(mapper_trials_dir)
+}
+
+file.create(file.path(mapper_trials_dir, "telemetry_traits.json"))
+write(
+  toJSON(export_data, auto_unbox = TRUE),
+  file = here::here(file.path(mapper_trials_dir, "telemetry_traits.json"))
+)
+```
+
+```{r}
+MapperPlotter(
+  telem_traits_mapper,
+  telem_traits_dem,
+  label = telem_traits_dem$adhd,
+  avg = FALSE
+)
+
+create_mapper_graph(
+  telem_traits_mapper,
+  colourisation = telem_traits_dem$adhd,
+  original_data = telem_traits_dem
+)
+```
+Before I fully analyse it, I need to 
+This mapper graph shows a small grouping of self-diagnosed participants, which is interesting.
+There is also a tail in mapper graph which shows just the ADHD groups.
+This was without the active_study_days (enabling some temporal reasoning).
+Although arguably, including the `active_study_days` may not change their telemetry data -
+you can play video games without doing the well-being survey.
+
+Nodes 2, 3, and 6 show the tail of Diagnosed ADHD participants, with 4, 9, and 5 being Self-Identified ADHD participants.
+```{r}
+mapper_node2 <- get_node_details(telem_traits_mapper, telem_traits_dem, 2)
+mapper_node2 |>
+  mutate(adhd = as.factor(adhd)) |>
+  skim()
+print(mapper_node2)
+```
+Node 2 consists of a sole american woman with diagnosed ADHD.
+From this participant, they participated in 44.7 days of the study.
+They only play on nintendo and mobile games, have a mean nintendo daily playtime of 196 minutes.
+However, they played 673 minutes in one day, which is a very large amount.
+
+```{r}
+mapper_node3 <- get_node_details(telem_traits_mapper, telem_traits_dem, 3)
+mapper_node3 |>
+  mutate(adhd = as.factor(adhd)) |>
+  skim()
+print(mapper_node3)
+```
+The same as node 2.
+
+```{r}
+mapper_node6 <- get_node_details(telem_traits_mapper, telem_traits_dem, 6)
+mapper_node6 |>
+  mutate(adhd = as.factor(adhd)) |>
+  summary()
+print(mapper_node6)
+```
+The same as node 2 again.
+It appears the 50 percent overlap and 10 intervals is finding inviduals who are very much outside of the population average.
+
+In conclusion, this mapper graph is actually showing very little
+
+```{r}
+mapper_node4 <- get_node_details(telem_traits_mapper, telem_traits_dem, 4)
+mapper_node4 |>
+  mutate(adhd = as.factor(adhd)) |>
+  summary()
+print(mapper_node4, width = Inf)
+```
+This is another american woman, but is self-diagnosed ADHD.
+They have participated in only around 3 days of the study, but also have a large binge day and similar daily total to the previous participant.
+It seems that the 'ADHD gold-nugget' found in the mapper graph is actually only identified 2 of the ADHD-related participants from the 502 in the data.
+
+```{r}
+mapper_node9 <- get_node_details(telem_traits_mapper, telem_traits_dem, 9)
+mapper_node9 |>
+  mutate(adhd = as.factor(adhd)) |>
+  summary()
+print(mapper_node9, width = Inf)
+```
+The same woman.
+
+```{r}
+mapper_node5 <- get_node_details(telem_traits_mapper, telem_traits_dem, 5)
+mapper_node5 |>
+  mutate(adhd = as.factor(adhd)) |>
+  summary()
+print(mapper_node5, width = Inf)
+```
+This node clearly shows the joining of two participants.
+
+The flare is characterised by the large nintendo playtimes, which also happens to be two participants that have ADHD.
+
+## Retrying with More columns
+I feel that just the summarised telemetry was a mistake.
+Mapper is a exploratory method, and limiting it to such summarisations hinders its unique ability for visual exploration.
+Here, I will try to include as much telemetry and well-being data.
+Specifically, I will now try to have a row per survey response, ideally joined by telemetry matching the survey timeframe,
+and any variables that have relation to ADHD.
+
+The new perspective of this mapper graph is to have one lens focussing on a way to distinguish between ADHD types,
+and another lens to spread the data so we can pull more information from it.
+
+### Data Preparation
+The gdt variables are mainly answered at the start of the study (wave 1) and at the end (wave 3).
+The self reported variables have a lot of missingness and shouldn't be used if I want lots of data for mapper.
+
+This cleaned biweekly survey data leaves us with lots of rows to analyse (6294).
+
+#### Telemetry Columns
+Now I need to join on the telemetry data that matches.
+This will be detailed descriptive statistics about the telemetry.
+This includes: average session time for each day of the week,
+maybe hourly metrics too?
+average session time per platform,
+standard deviation in these session metrics,
+longest session,
+day of longest session (during the week),
+average number of sessions a day,
+latest time to start a session during the working week,
+latest time to start a session at the weekend,
+earliest time to start a session during the working week,
+earliest time to start a session at the weekend,
+
+```{r}
+# average session time for each day of the week
+
+# join daily telemetry up to two weeks prior to the biweekly survey
+# excluding the lower bound, to include the current day of the survey
+wave_daily_telemetry <- biweekly |>
+  left_join(select(intake_participants, pid, adhd), by = "pid") |>
+  # cuts a lot of bangs missingness
+  filter(played_any_games == "Yes") |>
+  select(pid, survey_date = date, wave) |>
+  drop_na() |>
+  mutate(
+    survey_date = as.Date(survey_date),
+    min_twoweek_date = survey_date - weeks(2)
+  ) |>
+  left_join(
+    daily_telemetry,
+    by = join_by(
+      pid,
+      # get daily telemetry up to two weeks before response
+      # excludes survey day (could play more after survey)
+      min_twoweek_date <= day_local,
+      survey_date > day_local
+    ),
+    # account for response delays impacting other responses
+    relationship = "many-to-many"
+  ) |>
+  # start of the week will be Monday
+  # merge mobile instances
+  mutate(
+    day_of_week = lubridate::wday(day_local, week_start = 1),
+    platform = case_when(
+      platform == "iOS" ~ "Mobile",
+      platform == "Android" ~ "Mobile",
+      TRUE ~ platform
+    )
+  ) |>
+  # handle the duplicated "Mobile" rows
+  group_by(across(c(-minutes))) |>
+  summarise(minutes = sum(minutes), .groups = "drop") |>
+  # complete cases (0 for missing days)
+  group_by(pid, wave) |>
+  complete(
+    day_local = seq.Date(
+      first(min_twoweek_date),
+      first(survey_date),
+      by = "day"
+    ),
+    survey_date = first(survey_date),
+    min_twoweek_date = first(min_twoweek_date),
+    platform = c("Mobile", "Steam", "Xbox", "Nintendo"),
+    fill = list(minutes = 0)
+  ) |>
+  ungroup() |>
+  mutate(day_of_week = lubridate::wday(day_local, week_start = 1)) |>
+  filter(!is.na(day_local) & !is.na(platform))
+
+wave_daily_totals <- wave_daily_telemetry |>
+  pivot_wider(
+    names_from = platform,
+    values_from = minutes,
+    names_glue = "{platform}_{.value}",
+  ) |>
+  rename_with(tolower) |>
+  mutate(
+    total_minutes = steam_minutes + xbox_minutes +
+      mobile_minutes + nintendo_minutes
+  )
+
+biweekly_mapper_telemetry <- wave_daily_totals |>
+  group_by(pid, wave) |>
+  summarise(
+    # telemetry frequency
+    days_played = sum(total_minutes > 0),
+    total_wave_minutes = sum(total_minutes),
+    # central tendendencies and spread of telemetry
+    mean_daily_minutes = mean(total_minutes),
+    median_daily_minutes = median(total_minutes),
+    sd_daily_minutes = sd(total_minutes),
+    # coefficient of variation of daily minutes
+    cv_daily_minutes = if_else(
+      mean_daily_minutes == 0,
+      0,
+      sd_daily_minutes / mean_daily_minutes
+    ),
+    # hyperfocus/binge metrics
+    max_binge_minutes = max(total_minutes),
+    binge_day_of_week = if_else(
+      max_binge_minutes > 0,
+      day_of_week[which.max(total_minutes)],
+      NA_real_ # unlikely to happen, but check
+    ),
+    # structure of telemetry metrics
+    mean_weekday_minutes = mean(total_minutes[day_of_week %in% 1:5]),
+    mean_weekend_minutes = mean(total_minutes[day_of_week %in% 6:7]),
+    # context switching
+    mean_mobile = mean(mobile_minutes),
+    mean_steam = mean(steam_minutes),
+    mean_nintendo = mean(nintendo_minutes),
+    mean_xbox = mean(xbox_minutes),
+    platforms_used = sum(c(
+      any(mobile_minutes > 0),
+      any(steam_minutes > 0),
+      any(xbox_minutes > 0),
+      any(nintendo_minutes > 0)
+    )),
+    binge_day_of_week = factor(
+      binge_day_of_week,
+      levels = c(1, 2, 3, 4, 5, 6, 7),
+      labels = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+    ),
+    binge_day_of_week = fct_na_value_to_level(binge_day_of_week, level = "None"),
+    # keep pid and wave columns
+    .groups = "drop"
+  )
+```
+Now I have my biweekly telemetry data!
+
+However, I need to sort my cognitive data.
+As there is only 18% of the rows with complete data (all waves), I cannot simply use a long format.
+Therefore, I can just use a average of the values.
+This will guarantee a single metric, but loses the temporal changes that I would like to see through ADHD participants.
+To overcome this, I could plot regression models of the metrics over the waves, and use the gradient as a new feature.
+That way, single responses report no change, and multiple responses show the changes through time.
+```{r}
+simon |>
+  left_join(select(intake_participants, pid, adhd)) |>
+  group_by(adhd, pid) |>
+  summarise(waves_completed = n_distinct(wave), .groups = "drop") |>
+  count(adhd, waves_completed)
+
+simon |>
+  mutate(
+    simon_mobile_used = if_else(device_type == "Mobile", 1, 0),
+    hour_submitted = hour(datetime)
+  ) |>
+  select(-datetime, -device_type)
+
+simon |>
+  group_by(pid, wave) |>
+  summarise(
+    has_na = any(if_any(ends_with("final"), is.na)),
+    .groups = "drop"
+  ) |>
+  pivot_wider(
+    names_from = wave,
+    values_from = has_na,
+    names_prefix = "na_wave_"
+  ) |>
+  mutate(across(starts_with("na_wave_"), ~ replace_na(.x, TRUE))) |>
+  count(na_wave_1, na_wave_3, na_wave_5)
+
+simon_traits <- simon |>
+  filter(!is.na(meanrt_final)) |>
+  group_by(pid) |>
+  summarise(
+    simon_waves_count = n_distinct(wave),
+    rt_mean = mean(meanrt_final, na.rm = TRUE),
+    rt_sd = ifelse(n() > 1, sd(meanrt_final, na.rm = TRUE), 0),
+    # roc: rate of change (gradient of rt over time)
+    rt_roc = ifelse(
+      n() >= 2,
+      coef(lm(meanrt_final ~ wave))[2],
+      0
+    ),
+    score_mean = mean(score_final, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+biweekly_mapper_data <- biweekly |>
+  left_join(select(intake_participants, pid, adhd), by = "pid") |>
+  filter(!is.na(adhd)) |>
+  mutate(adhd = as.factor(adhd)) |>
+  select(pid, adhd, wave, date, affective_valence, life_sat,
+    starts_with("bangs_"), -starts_with("bangs_dup"), -bangs_failed_att_check,
+    starts_with("gaming_value"),
+    starts_with("wemwbs"),
+    played_any_games
+  ) |>
+  # cuts a lot of bangs missingness
+  filter(played_any_games == "Yes") |>
+  drop_na() |>
+  select(-played_any_games) |>
+  left_join(biweekly_mapper_telemetry, by = join_by(pid, wave)) |>
+  # add reaction time data
+  left_join(simon_traits, by = "pid") |>
+  drop_na()
+
+summary(biweekly_mapper_data)
+cat("Number of unique participants:", length(unique(biweekly_mapper_data$pid)))
+cat("Dimension of mapper data:", dim(biweekly_mapper_data))
+```
+
+### Filter Functions
+
+Due to the large amount of data,
+we will need filter functions capable of explaining/understanding properties of ADHD participants,
+and measuring the fundamental topology.
+
+#### ADHD Explainability
+The first lens/filter needs to try and represent the underlying properties that can describe ADHD participants.
+I want to try either factor analysis of 3 compnents (for the ADHD groups) or some machine learning.
+This methodology is inspired by the [KeplerMapper breast cancer example](https://kepler-mapper.scikit-tda.org/en/latest/generated/gallery/plot_breast_cancer.html).
+
+##### PCA
+```{r}
+n_components <- 2
+
+# data scaling
+biweekly_mapper_data_scaled <- biweekly_mapper_data |>
+  select(-pid, -date, -adhd, -binge_day_of_week) |>
+  # scale by dividing by standard deviation
+  mutate(across(everything(), ~scale(.)[,1]))
+
+biweekly_mapper_pca <- prcomp(biweekly_mapper_data_scaled, center = FALSE, scale = FALSE)
+summary(biweekly_mapper_pca)
+```
+
+1 or 2 principal components does not cover enough of the data's variance (0.16/0.33).
+```{r}
+ggplot(
+  biweekly_mapper_pca$x,
+  aes(x = PC1, y = PC2, colour = biweekly_mapper_data$adhd)
+) +
+  geom_point()
+
+ggplot(biweekly_mapper_pca$x, aes(y = PC1)) +
+  geom_histogram()
+```
+
+I do not think there is enough variance accounted for using PCA.
+
+##### t-SNE
+This is another dimensionality reduction method that converts the distances between points into probabilities.
+The interest in using this method is because it is non-linear, which may overcome PCA's problem.
+
+```{r}
+set.seed(30)
+
+# the scaled data was automatically centred
+tsne_results <- Rtsne(
+  biweekly_mapper_data_scaled,
+  dims = 1,
+  pca_center = FALSE,
+  pca_scale = FALSE
+)
+
+tsne_vec <- as.vector(tsne_results$Y)
+```
+
+```{r}
+(
+  ggplot(as.data.frame(tsne_results$Y), aes(y = V1)) +
+  geom_histogram()
+) +
+(
+  ggplot(as.data.frame(tsne_results$Y), aes(y = V1)) +
+  geom_boxplot()
+)
+```
+
+Quick check to use the original data and let t-SNE handle the scaling.
+```{r}
+tsne_2 <- Rtsne(
+  biweekly_mapper_data,
+  dims = 2,
+  # theta = 0.0, # exact t-SNE
+  pca_center = TRUE,
+  pca_scale = TRUE
+)
+
+ggplot(as.data.frame(tsne_2$Y), aes(x = V1, y = V2)) +
+  geom_point(aes(colour = biweekly_mapper_data$adhd))
+```
+
+##### Decision Trees
+My first idea is to create a decision tree capable of classifying ADHD participants.
+From this, we can use the decision process as a filter (like the PCA principal components).
+Decision trees are prone to overfitting, but in the case of exploring high-dimensional data, this can be okay.
+We can limit the trees to stop this, or use a bagging method.
+
+As we have imbalanced data, we need to change how we create the decision tree;
+using accuracy as the evaluation metric will result in a model trying to just predict the majority class.
+
+```{r}
+biweekly_mapper_data_dt <- biweekly_mapper_data |>
+  select(-pid, date)
+
+# prediction recipe
+adhd_recipe <- recipe(adhd ~ ., data = biweekly_mapper_data_dt)
+
+# cross-validation for hyperparameter tuning
+set.seed(30)
+five_folds_cv <- vfold_cv(biweekly_mapper_data_dt, v = 5, strata = adhd)
+
+# metrics focussing on imbalanced classes
+imbal_metrics <- metric_set(pr_auc, bal_accuracy, sens, spec)
+
+adhd_dt_spec <- decision_tree(
+  cost_complexity = tune(),
+  tree_depth = tune(),
+  min_n = tune()
+) |>
+  set_engine(
+    "rpart",
+    # equal priors
+    parms = list(prior = c(1/3, 1/3, 1/3))
+  ) |>
+  set_mode("classification")
+adhd_dt_spec |> translate()
+
+adhd_dt_wf <- workflow() |>
+  add_recipe(adhd_recipe) |>
+  add_model(adhd_dt_spec)
+
+adhd_dt_grid <- grid_regular(
+  cost_complexity(range = c(-8, -3)),
+  tree_depth(range = c(4, 8)),
+  min_n(range = c(2, 50)),
+  levels = 5
+)
+
+# tuning decision tree
+adhd_dt_results <- tune_grid(
+  adhd_dt_wf,
+  resamples = five_folds_cv,
+  grid = adhd_dt_grid,
+  metrics = imbal_metrics,
+)
+
+adhd_dt_best_params <- select_best(adhd_dt_results, metric = "pr_auc")
+
+adhd_dt_final_wf <- finalize_workflow(adhd_dt_wf, adhd_dt_best_params)
+adhd_dt_fit <- fit(adhd_dt_final_wf, data = biweekly_mapper_data_dt)
+
+adhd_dt_best_params
+
+adhd_dt <- extract_fit_engine(adhd_dt_fit)
+summary(adhd_dt)
+
+full_preds <- predict(
+  adhd_dt_fit,
+  new_data = biweekly_mapper_data_dt,
+  type = "prob"
+) |>
+  bind_cols(biweekly_mapper_data_dt |> select(adhd))
+
+adhd_dt_adhd_probs <- full_preds |>
+  select(pred_diagnosed_adhd = `.pred_Diagnosed ADHD`) |>
+  pull(pred_diagnosed_adhd)
+
+adhd_threshold_perf <- full_preds |>
+  # 2-level factor for classification
+  mutate(
+    adhd_binary = factor(
+      if_else(adhd == "Diagnosed ADHD", "Diagnosed ADHD", "Other"),
+      levels = c("Diagnosed ADHD", "Other")
+    )
+  ) |>
+  # threshold_perf using the exact column name with backticks
+  threshold_perf(
+    truth = adhd_binary,
+    estimate = `.pred_Diagnosed ADHD`,
+    thresholds = seq(0.05, 0.95, 0.05)
+  )
+```
+
+```{r}
+rpart.plot(
+  adhd_dt,
+  type = 4, # split labels along the left/right branches
+  extra = 104, # predicted class, class probabities, sample %
+  under = TRUE,
+  tweak = 1.1,
+  box.palette = "BlGnYl"
+)
+
+ggplot(adhd_threshold_perf, aes(x = .threshold, y = .estimate, color = .metric)) +
+  geom_line(linewidth = 1) +  # Updated size to linewidth for current ggplot2 versions
+  labs(
+    title = "Exploratory Threshold Performance for Diagnosed ADHD",
+    x = "Probability Threshold", 
+    y = "Score",
+    color = "Metric"
+  ) +
+  theme_minimal()
+
+optimal_threshold <- 0.3
+
+multiclass_preds <- full_preds |>
+  mutate(
+    # winning class based on priority and probabilities
+    .pred_class = case_when(
+      `.pred_Diagnosed ADHD` >= optimal_threshold ~ "Diagnosed ADHD",
+      `.pred_Neurotypical` >= `.pred_Self-Identified ADHD` ~ "Neurotypical",
+      TRUE ~ "Self-Identified ADHD"
+    ),
+    .pred_class = factor(.pred_class, levels = levels(adhd))
+  )
+
+# confusion matrix
+cm_3class <- multiclass_preds |>
+  conf_mat(truth = adhd, estimate = .pred_class)
+
+print(cm_3class)
+
+# confusion matrix as heatmap
+autoplot(cm_3class, type = "heatmap") +
+  labs(
+    title = "3-Class Confusion Matrix (Adjusted Threshold)",
+    subtitle = paste("Diagnosed ADHD threshold set at", optimal_threshold),
+    x = "Truth (Actual Class)",
+    y = "Prediction (Model Output)"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    axis.text.y = element_text(size = 10),
+    plot.title = element_text(face = "bold")
+  )
+```
+This is okay, but not particularly great probabilities (they're fixed).
+
+##### Boosted Decision Trees (XGBoost)
+
+I will try a Boosted Decision Tree (XGBoost):
+```{r}
+set.seed(30)
+
+xgb_data <- biweekly_mapper_data_scaled |>
+  add_column(biweekly_mapper_data$adhd) |>
+  rename(adhd = `biweekly_mapper_data$adhd`)
+
+data_split <- initial_split(
+  xgb_data,
+  prop = 0.80,
+  strata = adhd
+)
+train_data <- training(data_split)
+test_data  <- testing(data_split)
+
+# 5-fold cross validation for hyperparameter tuning
+cv_folds <- vfold_cv(train_data, v = 5, strata = adhd)
+
+# note: XGBoost requires all categorical predictors to be dummified
+adhd_xgb_recipe <- recipe(adhd ~ ., data = train_data) |>
+  # stop pid from being used in the the training
+  # update_role(pid, new_role = "ID") |>
+  # update_role(wave, new_role = "ID") |>
+  # encode categorical 
+  step_novel(all_nominal_predictors()) |>
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) |>
+  # remove zero-variance features
+  step_zv(all_predictors())
+  # # optional (toggle)
+  # themis::step_downsample(adhd, under_ratio = 1.5)
+
+# boosted tree with hyperparameter tuning
+adhd_xgb_spec <- boost_tree(
+  trees = tune(), # number of boosting iterations (nrounds)
+  tree_depth = tune(), # max depth of each individual tree
+  min_n = tune(), # minimum child weight to stop splitting
+  loss_reduction = tune(), # minimum gain to split further (gamma)
+  sample_size = tune(), # subsample ratio of training instances
+  mtry = tune(), # fraction of features sampled per tree
+  learn_rate = tune() # learning rate / shrinkage (eta)
+) |>
+  set_engine("xgboost", objective = "multi:softprob") |>
+  set_mode("classification")
+
+# workflow
+adhd_xgb_wf <- workflow() |>
+  add_recipe(adhd_xgb_recipe) |>
+  add_model(adhd_xgb_spec)
+
+# hyperparameter Tuning Grid
+# using Space-Filling Design to efficiently sample the parameter space
+adhd_xgb_grid <- grid_space_filling(
+  trees(range = c(50, 500)),
+  tree_depth(range = c(3, 8)),
+  min_n(range = c(2, 15)),
+  loss_reduction(range = c(1e-8, 10), trans = log10_trans()),
+  sample_size = sample_prop(range = c(0.5, 0.9)),
+  finalize(mtry(), train_data),
+  learn_rate(range = c(0.01, 0.2)),
+  size = 25  # Evaluates 25 distinct hyperparameter combinations
+)
+
+# grid search on folds
+cat("Starting hyperparameter tuning...\n")
+adhd_xgb_res <- tune_grid(
+  adhd_xgb_wf,
+  resamples = cv_folds,
+  grid = adhd_xgb_grid,
+  metrics = metric_set(roc_auc, mn_log_loss, accuracy),
+  control = control_grid(save_pred = TRUE, verbose = FALSE)
+)
+
+# choosing the best hyperparameters
+# ROC AUC multi-class metric evaluates class separation across thresholds
+best_params <- select_best(adhd_xgb_res, metric = "roc_auc")
+
+adhd_final_xgb_wf <- finalize_workflow(adhd_xgb_wf, best_params)
+
+# Fit on full training set and evaluate on test set
+adhd_final_fit <- last_fit(adhd_final_xgb_wf, data_split)
+collect_metrics(adhd_final_fit)
+
+# Now I can extract the continuous lens, the probabilities:
+# Fit final workflow on entire dataset
+fitted_xgb <- fit(adhd_final_xgb_wf, data = xgb_data)
+
+# Generate continuous class probability columns
+adhd_xgb_probs <- augment(fitted_xgb, new_data = xgb_data) |>
+  select(
+    adhd,
+    pred_diagnosed_adhd = `.pred_Diagnosed ADHD`,
+    pred_neurotypical = `.pred_Neurotypical`,
+    pred_self_idenfitied_adhd = `.pred_Self-Identified ADHD`
+  )
+
+# Inspect the smooth continuous probabilities ready for Mapper
+head(adhd_xgb_probs)
+
+# plot the probabilities of the classes, given the true class if diagnosed ADHD
+adhd_xgb_probs |>
+  pivot_longer(
+    cols = starts_with("pred_"),
+    names_to = "class_pred",
+    values_to = "prob"
+  ) |>
+  filter(adhd == "Diagnosed ADHD") |>
+  ggplot(aes(x = prob, fill = class_pred)) +
+  geom_density(alpha = 0.5)
+
+predictions <- predict(
+  fitted_xgb,
+  new_data = biweekly_mapper_data_scaled,
+  type = "class"
+) |>
+  add_column(biweekly_mapper_data |> pull(adhd)) |>
+  rename(
+    truth = `pull(biweekly_mapper_data, adhd)`,
+    pred = .pred_class
+  )
+
+xgb_cm <- predictions |>
+  conf_mat(truth, pred)
+```
+
+```{r}
+autoplot(xgb_cm, type = "heatmap")
+```
+This looks a lot better, and I will use the probability as the lens.
+
+
+##### Isolation Forest
+This classifies outliers in data, which could be useful in the ADHD data.
+
+```{r}
+set.seed(30)
+
+biweekly_mapper_data_noadhd <- biweekly_mapper_data |>
+  select(-pid, -adhd, -date)
+
+is_outlier <- biweekly_mapper_data$adhd %in% c("Diagnosed ADHD")
+
+model_orig <- isolation.forest(
+  biweekly_mapper_data_noadhd,
+  ndim = 1,
+  sample_size = 256,
+  ntrees = 500,
+  missing_action = "fail"
+)
+pred_orig <- predict(model_orig, biweekly_mapper_data_noadhd)
+
+model_dens <- isolation.forest(
+  biweekly_mapper_data_noadhd,
+  ndim = 1,
+  sample_size = 256,
+  ntrees = 500,
+  missing_action = "fail",
+  scoring_metric = "density"
+)
+pred_dens <- predict(model_dens, biweekly_mapper_data_noadhd)
+
+model_fcf <- isolation.forest(
+  biweekly_mapper_data_noadhd,
+  ndim = 1,
+  sample_size = 32,
+  prob_pick_pooled_gain = 1,
+  ntrees = 500,
+  missing_action = "fail"
+)
+pred_fcf <- predict(model_fcf, biweekly_mapper_data_noadhd)
+
+results_df <- data.frame(
+    Model = c(
+        "Isolation Forest",
+        "Density Isolation Forest",
+        "Fair-Cut Forest"
+    ),
+    AUROC = c(
+        AUC(pred_orig, is_outlier),
+        AUC(pred_dens, is_outlier),
+        AUC(pred_fcf, is_outlier)
+    )
+)
+results_df
+```
+
+#### Measures of Closeness
+
+First, let us recap the structure of mapper data:
+```{r}
+summary(biweekly_mapper_data)
+```
+
+##### Distance Mean
+Taken from the paper at doi.org/10.1109/jsen.2021.3130570.
+This first calculates the mean of every column, the euclidean distances for each row and column,
+then sum the column distances for each row.
+This will produce a m x 1 matrix where m is the number of rows, which follows the same standard as
+the previous filter functions.
+
+```{r}
+# these should be zero as the data is scaled
+scaled_col_means <- colMeans(biweekly_mapper_data_scaled)
+
+# the euclidean distance between two single points is just the absolute difference
+A_dist <- sweep(biweekly_mapper_data_scaled, 2, scaled_col_means, "-")
+dist_mean <- rowSums(A_dist^2)
+```
+
+```{r}
+ggplot(as.data.frame(dist_mean), aes(x = dist_mean)) + geom_histogram()
+```
+The model appears to missclassify self-identified ADHD participants are Neurotypical rather than Diagnosed ADHD.
+
+##### Distance from Neurotypical Average
+I want to try calculating the column averages for the Neurotypical, then applying a similar method to dist mean.
+```{r}
+neurotypical_means <- biweekly_mapper_data_scaled |>
+  add_column(biweekly_mapper_data$adhd, .before = TRUE) |>
+  rename(adhd = `biweekly_mapper_data$adhd`) |>
+  filter(adhd == "Neurotypical") |>
+  select(-adhd) |>
+  colMeans()
+
+neuro_diffs <- sweep(biweekly_mapper_data_scaled, 2, neurotypical_means, "-")
+neuro_dists <- rowSums(neuro_diffs^2)
+```
+
+##### Density Estimation
+```{r}
+mapper_dmatrix <- dist(biweekly_mapper_data_scaled)
+mapper_density <- density_estimation(mapper_dmatrix)
+density_lens <- as.vector(mapper_density$values)
+```
+
+```{r}
+ggplot(as.data.frame(density_lens), aes(x = density_lens)) +
+  geom_histogram()
+```
+
+##### L2 Norm
+```{r}
+l2_norms <- biweekly_mapper_data |>
+  select(where(is.numeric)) |>
+  apply(1, norm, type = "2")
+```
+
+#### Columns from the data
+A quick look at some of the columns:
+```{r}
+ggplot(biweekly_mapper_data) +
+  geom_point(aes(
+    x = affective_valence,
+    y = biweekly_mapper_pca$x[, 1],
+  )) +
+  facet_wrap(vars(adhd))
+
+wemwbs_total <- biweekly_mapper_data |>
+  mutate(
+    wemwbs_total = wemwbs_1 +
+      wemwbs_2 + wemwbs_3 + wemwbs_4 +
+      wemwbs_5 + wemwbs_6 + wemwbs_7,
+  ) |>
+  pull(wemwbs_total) |>
+  scale()
+
+ggplot(biweekly_mapper_data) +
+  geom_point(aes(
+    x = wemwbs_total,
+    y = wave,
+  )) +
+  facet_wrap(vars(adhd))
+```
+
+#### Evaluating Functions
+Let's check the correlations:
+```{r}
+biweekly_mapper_filters <- tibble(
+  adhd = biweekly_mapper_data$adhd,
+  pc1 = biweekly_mapper_pca$x[, 1],
+  pc2 = biweekly_mapper_pca$x[, 2],
+  dt = adhd_dt_adhd_probs,
+  xgb_adhd_pred = adhd_xgb_probs$pred_diagnosed_adhd,
+  iso_forest = pred_orig,
+  iso_forest_den = pred_dens,
+  iso_forest_fc = pred_fcf,
+  tsne = tsne_vec,
+  dist_mean = dist_mean,
+  density_estimated = density_lens,
+  neuro_dist = neuro_dists,
+  affective_val = biweekly_mapper_data$affective_valence,
+  wemwbs_total = wemwbs_total[,1],
+  l2_norm = l2_norms
+)
+filters_cor <- cor(select(biweekly_mapper_filters, -adhd))
+filters_cor[] <- vapply(filters_cor, round, double(1), digits=2)
+filters_cor
+```
+
+##### Spread Visualisations
+
+```{r}
+ggpairs(
+  biweekly_mapper_filters,
+  columns = 2:ncol(biweekly_mapper_filters),
+  aes(colour = adhd, alpha = 0.5)
+)
+```
+Across all filter combinations, the data is very dense.
+This leads me to choose DBSCAN as the clustering algorithm.
+
+## Mapper Trials
+```{r}
+make_mapper_filename <- function(
+  mapper_name = "mapper",
+  cover_type = NULL,
+  intervals = NULL,
+  overlap = NULL,
+  width = NULL,
+  method = NULL,
+  method_params = NULL,
+  ext = "json"
+) {
+  parts <- c()
+
+  if (!is.null(mapper_name) && nzchar(mapper_name)) {
+    parts <- c(parts, mapper_name)
+  } else {
+    parts <- c(parts, "mapper")
+  }
+  if (!is.null(cover_type) && nzchar(cover_type)) {
+    parts <- c(parts, paste0("cov", cover_type))
+  }
+  if (!is.null(intervals) && nzchar(intervals)) {
+    parts <- c(parts, paste0("int", intervals))
+  }
+  if (!is.null(overlap) && !is.na(overlap)) {
+    parts <- c(parts, paste0("ov", overlap))
+  }
+  if (!is.null(width) && !is.na(width)) {
+    parts <- c(parts, paste0("w", width))
+  }
+  if (!is.null(method) && !is.na(method) && nzchar(method)) {
+    parts <- c(parts, method)
+  }
+  if (!is.null(method_params) && length(method_params) > 0) {
+    valid_params <- method_params[!sapply(method_params, function(x) is.null(x) || is.na(x))]
+    if (length(valid_params) > 0) {
+      param_names <- names(valid_params)
+      if (is.null(param_names)) param_names <- rep("", length(valid_params))
+      param_str <- paste(param_names, unlist(valid_params), sep = "", collapse = "_")
+      parts <- c(parts, param_str)
+    }
+  }
+  ext <- sub("^\\.", "", ext)
+  filename <- paste0(paste(parts, collapse = "_"), ".", ext)
+  return(filename)
+}
+
+# add a colourisation feature
+biweekly_mapper_data <- biweekly_mapper_data |>
+  mutate(is_adhd = if_else(adhd == "Diagnosed ADHD", 1, 0)) |>
+  relocate(adhd)
+```
+One of the filter functions should try to disperse the data, if possible by ADHD.
+Examining the visualisations indicates that `dist_mean` or `PC1` is most capable at spreading the data.
+PCA is designed to specifically extract the directions of maximum variance in the data.
+However, it is not easily interpretable as it reduces the dimensions.
+`dist_mean` is easily explainble as the sum of the residuals per row.
+Therefore, I will choose `dist_mean`.
+
+For the other filter, now that we have a metric that tries to disperse the data,
+should aim to provide some explanation to the question I am exploring:
+ADHD traits/features.
+To do so requires some way of classifying the data by likelihood of having ADHD.
+
+### First two principal components
+```{r}
+pca_lens <- biweekly_mapper_filters |>
+  select(pc1, pc2) |>
+  as.matrix()
+
+
+# find bins to use (we have a large outlier for distances)
+# biweekly_dists <- dist(biweekly_mapper_data_scaled)
+# ggplot(as.data.frame(biweekly_dists), aes(x = x)) +
+#   geom_histogram(bins = 80)
+
+# mapper_pca_grid <- GridSearch(
+#   original_data = biweekly_mapper_data_scaled,
+#   filter_values = pca_lens,
+#   label = biweekly_mapper_data$adhd,
+#   column = "ADHD",
+#   cover_type = "stride",
+#   width_vec = c(0.2, 0.4, 0.5, 0.75, 1.0),
+#   overlap_vec = c(20, 30, 50),
+#   num_cores = 12,
+#   out_dir = "examples/open-play/biweekly_pca_grid"
+# )
+```
+
+```{r}
+# mapper_name <- "biweekly_pca"
+# cover_type <- "stride"
+# intervals <- NULL
+# overlap <- 50
+# width <- 5
+# method <- "dbscan"
+# method_params <- list(eps = 5, minPts = 20)
+
+mapper_name <- "biweekly_pca"
+cover_type <- "stride"
+intervals <- 10
+overlap <- 30
+width <- NULL
+method <- "kmeans"
+method_params <- list(max_kmeans_clusters = 2)
+
+filename <- make_mapper_filename(
+  mapper_name = mapper_name,
+  cover_type = cover_type,
+  intervals = intervals,
+  overlap = overlap,
+  width = width,
+  method = method,
+  method_params = method_params
+)
+
+cat("Creating file:", filename, "\n", sep = "")
+
+pca_mapper <- MapperAlgo(
+  original_data = biweekly_mapper_data_scaled,
+  filter_values = pca_lens,
+  percent_overlap = overlap,
+  methods = method,
+  method_params = method_params,
+  cover_type = cover_type,
+  intervals = intervals,
+  interval_width = width,
+  num_cores = 12
+)
+
+export_data <- list(
+  adjacency = pca_mapper$adjacency,
+  num_vertices = pca_mapper$num_vertices,
+  level_of_vertex = pca_mapper$level_of_vertex,
+  points_in_vertex = pca_mapper$points_in_vertex,
+  original_data = biweekly_mapper_data
+)
+
+mapper_trials_dir <- file.path("examples", "open-play", "mappers")
+if (!dir.exists(mapper_trials_dir)) {
+  dir.create(mapper_trials_dir)
+}
+
+file.create(file.path(mapper_trials_dir, filename))
+write(
+  toJSON(export_data, auto_unbox = TRUE),
+  file = here::here(file.path(mapper_trials_dir, filename))
+)
+# MapperPlotter(
+#   pca_mapper,
+#   original_data = biweekly_mapper_data_scaled,
+#   label = biweekly_mapper_data$adhd
+# )
+```
+Tried:
+- DBSCAN(eps=0.3, minPts=5), 50%, width=0.4: massive graph too many nodes
+- DBSCAN(eps=0.3, minPts=5), 30%, width=0.4: too many clusters to check, no structure
+- DBSCAN(eps=0.3, minPts=20), 50%, width=0.4: improving, but still lots of central nodes with not many ADHD in
+- Same with width = 1.5 and minPts = 40:
+- Kmeans (3 clusters for ADHD), 10 intervals: too small nodes
+- Same with 5 intervals, too many connections and overlap
+- Now 30% overlap:
+- Kmeans 2: for two ADHD groups
+Increasing width to 5 gave nicer results, only 58 nodes, but we have too many people in some nodes (2000, a third), eps is 30?!
+
+### Density Estimation & Dist Mean
+```{r}
+dist_dens_lens <- biweekly_mapper_filters |>
+  select(dist_mean, density_estimated) |>
+  as.matrix()
+
+n_cols <- ncol(biweekly_mapper_data)
+
+# minPts: >= d + 1, 2 x d
+# eps: kNN distance graph to find elbow
+k_val <- ncol(biweekly_mapper_data) + 1
+kNNdistplot(biweekly_mapper_data_num, k = k_val)
+
+dist_dens_mapper <- MapperAlgo(
+  original_data = biweekly_mapper_data_num,
+  filter_values = dist_dens_lens,
+  percent_overlap = 50,
+  methods = "dbscan",
+  method_params = list(eps = 1.5, minPts = k_val),
+  intervals = 10,
+  num_cores = 10
+)
+
+dist_dens_mapper_single <- MapperAlgo(
+  original_data = biweekly_mapper_data_num,
+  filter_values = dist_dens_lens,
+  percent_overlap = 50,
+  methods = "hierarchical",
+  method_params = list(method = "single", num_bins_when_clustering = 10),
+  intervals = 10,
+  num_cores = 10
+)
+
+MapperPlotter(
+  dist_dens_mapper_single,
+  original_data = biweekly_mapper_data_num,
+  label = biweekly_mapper_data$adhd
+)
+```
+
+### More meaningful columns
+
+```{r} 
+meaningful_lens <- biweekly_mapper_filters |>
+  select(density_estimated, affective_val) |>
+  add_column(biweekly_mapper_data$wave) |>
+  rename(wave = `biweekly_mapper_data$wave`)
+```
+
+```{r}
+mapper_name <- "biweekly_dens_affval_wave"
+cover_type <- "stride"
+intervals <- 10
+overlap <- 50
+width <- NULL
+method <- "kmeans"
+method_params <- list(max_kmeans_clusters = 2)
+
+filename <- make_mapper_filename(
+  mapper_name = mapper_name,
+  cover_type = cover_type,
+  intervals = intervals,
+  overlap = overlap,
+  width = width,
+  method = method,
+  method_params = method_params
+)
+
+cat("Creating file:", filename, "\n", sep = "")
+
+meaningful_mapper <- MapperAlgo(
+  original_data = biweekly_mapper_data_scaled,
+  filter_values = meaningful_lens,
+  percent_overlap = overlap,
+  methods = method,
+  method_params = method_params,
+  cover_type = cover_type,
+  intervals = intervals,
+  interval_width = width,
+  num_cores = 12
+)
+
+export_data <- list(
+  adjacency = meaningful_mapper$adjacency,
+  num_vertices = meaningful_mapper$num_vertices,
+  level_of_vertex = meaningful_mapper$level_of_vertex,
+  points_in_vertex = meaningful_mapper$points_in_vertex,
+  original_data = biweekly_mapper_data
+)
+
+mapper_trials_dir <- file.path("examples", "open-play", "mappers")
+if (!dir.exists(mapper_trials_dir)) {
+  dir.create(mapper_trials_dir)
+}
+
+file.create(file.path(mapper_trials_dir, filename))
+write(
+  toJSON(export_data, auto_unbox = TRUE),
+  file = here::here(file.path(mapper_trials_dir, filename))
+)
+```

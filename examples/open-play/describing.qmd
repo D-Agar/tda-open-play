@@ -1343,7 +1343,7 @@ daily_participants |>
     cols = c("bpnsfs_1", "bpnsfs_2", "bpnsfs_3", "bpnsfs_4", "bpnsfs_5", "bpnsfs_6"),
     names_to = "bpnsfs",
     values_to = "value"
-  ) |> 
+  ) |>
   ggplot(aes(x = value)) +
   geom_histogram(bins=5) +
   facet_wrap(~bpnsfs) +
