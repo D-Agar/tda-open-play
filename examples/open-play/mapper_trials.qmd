@@ -1589,12 +1589,6 @@ dist_dens_mapper_single <- MapperAlgo(
   intervals = 10,
   num_cores = 10
 )
-
-MapperPlotter(
-  dist_dens_mapper_single,
-  original_data = biweekly_mapper_data_num,
-  label = biweekly_mapper_data$adhd
-)
 ```
 
 ### More meaningful columns
