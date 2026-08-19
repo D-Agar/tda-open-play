@@ -1,0 +1,1069 @@
+---
+title: "Analysing the final Mapper Graph"
+author:
+  name: Daniel Agar
+format:
+  pdf: default
+  html:
+    toc: true
+  docx: default
+---
+
+```{r}
+#| label: libraries
+#| include: false
+#| output: false
+#| code-summary: "Show code (Load required R packages)"
+library(tidyverse)
+library(MapperAlgo)
+library(igraph)
+library(jsonlite)
+library(knitr) # latex tables
+
+theme_set(theme_minimal())
+source("examples/open-play/helpers.R")
+source("utils.R")
+
+sourceDir("mapper", exclude = "test.R")
+```
+
+```{r}
+#| label: data setup
+#| include: false
+#| cache: true
+#| output: false
+
+# cleaned data from Ballou
+android <- read_csv("data/open-play/clean/android.csv.gz")
+metadata <- read_csv("data/open-play/clean/game_metadata.csv.gz")
+ios <- read_csv("data/open-play/clean/ios.csv.gz")
+nintendo <- read_csv("data/open-play/clean/nintendo.csv.gz")
+simon <- read_csv("data/open-play/clean/simon.csv.gz")
+steam <- read_csv("data/open-play/clean/steam.csv.gz")
+steam_visibility <- read_csv(
+  "data/open-play/raw/telemetry_steam_account_linking_raw.csv.gz"
+)
+biweekly <- read_csv("data/open-play/clean/survey_biweekly_final.csv.gz")
+daily <- read_csv("data/open-play/clean/survey_daily_final.csv.gz", guess_max = 10000)
+intake_participants <- read_csv("data/open-play/clean/survey_intake_participants_final.csv.gz", guess_max = 34000)
+participant_coords <- read_csv("data/open-play/clean/participant_coords.csv.gz")
+time_use <- read_csv("data/open-play/clean/timeuse.csv.gz") |>
+  filter(quality_flag == "Good quality")
+xbox <- read_csv("data/open-play/clean/xbox.csv.gz")
+
+# get the mapper data
+# merge with the local time zone offsets from intake participants
+# Note: We keep country and local_timezone for DST-aware conversion
+tz_map <- intake_participants |>
+  mutate(
+    pid,
+    country,
+    local_timezone,
+    .keep = "none"
+  ) |>
+  distinct(pid, .keep_all = TRUE)
+
+# aggregate data at each level of granularity (session, hourly, daily)
+# session level (Nintendo, Xbox, Steam already at session level)
+session_telemetry <- bind_rows(
+  xbox |> mutate(platform = "Xbox"),
+  nintendo |> mutate(platform = "Nintendo"),
+) |>
+  left_join(tz_map, by = "pid") |>
+  filter(!is.na(local_timezone)) |>
+  mutate(
+    # Calculate DST-aware offset for each timestamp
+    offset_start = get_dst_offset(session_start, country, local_timezone),
+    offset_end = get_dst_offset(session_end, country, local_timezone),
+    # Add offset to get local time values (keeping UTC label for compatibility)
+    start_local = session_start + offset_start,
+    end_local = session_end + offset_end,
+    duration_min = as.numeric(difftime(
+      session_end,
+      session_start,
+      units = "mins"
+    ))
+  ) |>
+  filter(
+    !is.na(session_start),
+    !is.na(session_end),
+    session_end > session_start,
+    duration_min >= 1
+  )
+
+# Hourly from sessions (Nintendo + Xbox)
+# Join with timezone map and calculate DST-aware offsets
+# Note: start_local/end_local have UTC labels but local time VALUES (for hour extraction)
+sessions_telemetry <- bind_rows(
+  xbox |> mutate(platform = "Xbox"),
+  nintendo |> mutate(platform = "Nintendo")
+) |>
+  mutate(pid = as.character(pid)) |>
+  left_join(tz_map, by = "pid") |>
+  filter(!is.na(local_timezone)) |>
+  mutate(
+    # Calculate DST-aware offset for each timestamp
+    offset_start = get_dst_offset(session_start, country, local_timezone),
+    offset_end = get_dst_offset(session_end, country, local_timezone),
+    # Add offset to get local time values (keeping UTC label for compatibility)
+    start_local = session_start + offset_start,
+    end_local = session_end + offset_end,
+    duration_min = as.numeric(difftime(
+      session_end,
+      session_start,
+      units = "mins"
+    ))
+  ) |>
+  filter(
+    !is.na(session_start),
+    !is.na(session_end),
+    session_end > session_start,
+    duration_min >= 1
+  )
+
+hourly_from_sessions <- sessions_telemetry |>
+  filter(!is.na(start_local), !is.na(end_local)) |>
+  mutate(
+    h0_local = floor_date(start_local, "hour"),
+    h1_local = floor_date(end_local - seconds(1), "hour"),
+    n_hours = as.integer(difftime(h1_local, h0_local, units = "hours")) + 1
+  ) |>
+  filter(!is.na(n_hours), n_hours > 0) |>
+  tidyr::uncount(n_hours, .remove = FALSE, .id = "k") |>
+  mutate(
+    hour_start_local = h0_local + hours(k - 1),
+    minutes = pmax(
+      0,
+      as.numeric(difftime(
+        pmin(end_local, hour_start_local + hours(1)),
+        pmax(start_local, hour_start_local),
+        units = "mins"
+      ))
+    ),
+    # Convert back to UTC (this preserves the instant, just changes label)
+    hour_start_utc = with_tz(hour_start_local, tzone = "UTC")
+  ) |>
+  select(pid, platform, hour_start_local, hour_start_utc, minutes)
+
+# --- Hourly from Steam (already hourly) -------------------------------------
+hourly_from_steam <- steam |>
+  select(pid, datetime_hour_start, minutes) |>
+  mutate(pid = as.character(pid)) |>
+  left_join(tz_map, by = "pid") |>
+  filter(!is.na(local_timezone)) |>
+  mutate(
+    platform = "Steam",
+    hour_start_utc = datetime_hour_start,
+    # Calculate DST-aware offset and add to get local time values
+    offset = get_dst_offset(datetime_hour_start, country, local_timezone),
+    hour_start_local = datetime_hour_start + offset
+  ) |>
+  select(pid, platform, hour_start_local, hour_start_utc, minutes)
+
+hourly_telemetry <- bind_rows(hourly_from_sessions, hourly_from_steam)
+
+# Daily (Nintendo + Xbox + Steam; collapse hourly to days)
+daily_telemetry <- hourly_telemetry |>
+  mutate(
+    day_local = as.Date(hour_start_local),
+  ) |>
+  group_by(pid, platform, day_local) |>
+  summarise(minutes = sum(minutes, na.rm = TRUE), .groups = "drop") |>
+  bind_rows(ios) |>
+  bind_rows(android)
+
+daily_ios_android <- bind_rows(
+  ios |>
+    transmute(
+      pid = as.character(pid),
+      platform = "iOS",
+      day_local = as.Date(day_local),
+      minutes
+    ),
+  android |>
+    transmute(
+      pid = as.character(pid),
+      platform = "Android",
+      day_local = as.Date(day_local),
+      minutes
+    )
+)
+
+daily_all <- bind_rows(daily_telemetry, daily_ios_android) |>
+  group_by(pid, day_local) |>
+  summarise(total_minutes = sum(minutes, na.rm = TRUE), .groups = "drop")
+
+# Weekly
+weekly_all <- daily_telemetry |>
+  mutate(
+    week = floor_date(day_local, "week")
+  ) |>
+  group_by(pid, platform, week) |>
+  summarise(minutes = sum(minutes, na.rm = TRUE), .groups = "drop")
+
+telemetry_spans <- daily_telemetry |>
+  group_by(pid, platform) |>
+  summarise(
+    telemetry_start = min(day_local, na.rm = TRUE),
+    # end of last hour bin
+    telemetry_end = max(day_local, na.rm = TRUE) + hours(1),
+    week = floor_date(telemetry_end, "week"),
+    n_weeks = as.integer(difftime(
+      telemetry_end,
+      telemetry_start,
+      units = "weeks"
+    )) +
+      1,
+    .groups = "drop"
+  )
+
+platforms <- c("Steam", "Nintendo", "Xbox", "Android", "iOS")
+
+# study lasts 12 weeks
+# start at 0 for first day
+study_duration_days <- 83
+
+daily_start_dates <- daily |>
+  group_by(pid) |>
+  mutate(first_wave = min(wave)) |>
+  ungroup() |>
+  filter(wave == first_wave) |>
+  select(pid, daily_start_date = date, first_wave)
+
+biweekly_start_dates <- biweekly |>
+  group_by(pid) |>
+  mutate(first_wave = min(wave)) |>
+  ungroup() |>
+  filter(wave == first_wave) |>
+  select(pid, biweekly_start_date = date, first_wave)
+
+survey_start_dates <- biweekly_start_dates |>
+  full_join(daily_start_dates, by = join_by(pid)) |>
+  mutate(started_study = as.Date(pmin(biweekly_start_date, daily_start_date, na.rm = TRUE))) |>
+  select(pid, started_study)
+
+last_daily_survey <- daily |>
+  group_by(pid) |>
+  summarise(last_daily_survey = max(date, na.rm = TRUE))
+
+last_biweekly_survey <- biweekly |>
+  group_by(pid) |>
+  summarise(last_biweekly_survey = max(date, na.rm = TRUE))
+
+last_daily_telemetry <- daily_telemetry |>
+  group_by(pid) |>
+  summarise(last_ping = max(day_local, na.rm = TRUE))
+
+participant_windows <- survey_start_dates |>
+  left_join(last_daily_survey, by = "pid") |>
+  left_join(last_biweekly_survey, by = "pid") |>
+  left_join(last_daily_telemetry, by = "pid") |>
+  mutate(
+    last_survey_date = pmax(last_daily_survey, last_biweekly_survey, na.rm = TRUE),
+    active_study_days = as.numeric(difftime(last_survey_date, started_study, units = "days")) + 1,
+    active_study_days = pmin(active_study_days, study_duration_days)
+  )
+
+# participant timelines dynamically creating rows up till the last day of participation
+study_timeline <- participant_windows |>
+  filter(!is.na(active_study_days)) |> # drop pid with zero usable dates
+  mutate(study_day_offset = map(active_study_days, ~0:(.x - 1))) |>
+  unnest(study_day_offset) |>
+  mutate(day_local = started_study + study_day_offset) |>
+  select(pid, started_study, last_survey_date, active_study_days, day_local, study_day_offset)
+
+wide_daily_telemetry <- daily_telemetry |>
+  distinct(pid, platform, day_local, .keep_all = TRUE) |>
+  pivot_wider(
+    names_from = platform,
+    names_glue = "{platform}_minutes",
+    values_from = minutes,
+    values_fill = 0
+  ) |>
+  rename_with(tolower)
+
+complete_daily_telemetry <- study_timeline |>
+  left_join(wide_daily_telemetry, by = join_by(pid, day_local)) |>
+  mutate(
+    across(ends_with("_minutes"), ~replace_na(.x, 0)),
+    day_of_week = wday(day_local)
+  )
+
+telemetry_traits <- complete_daily_telemetry |>
+  group_by(pid, active_study_days) |>
+  summarise(
+    # activity stats
+    mean_daily_steam_minutes = sum(steam_minutes, na.rm = TRUE) /
+      first(active_study_days),
+    mean_daily_nintendo_minutes = sum(nintendo_minutes, na.rm = TRUE) /
+      first(active_study_days),
+    mean_daily_xbox_minutes = sum(xbox_minutes, na.rm = TRUE) /
+      first(active_study_days),
+    mean_daily_mobile_minutes = sum(ios_minutes + android_minutes, na.rm = TRUE) /
+      first(active_study_days),
+    mean_daily_total = sum(
+      steam_minutes + nintendo_minutes + xbox_minutes +
+        ios_minutes + android_minutes, na.rm = TRUE
+    ) / first(active_study_days),
+
+    max_binge_day = max(steam_minutes + nintendo_minutes + xbox_minutes + ios_minutes + android_minutes, na.rm = TRUE),
+
+    # gaming traits
+    active_gaming_ratio = mean((steam_minutes + nintendo_minutes + xbox_minutes + ios_minutes + android_minutes) > 0),
+    .groups = "drop_last"
+  ) |>
+  ungroup()
+
+interested_deomographic_cols <- c(
+  "adhd",
+  "country", "long", "lat",
+  "age", "gender", "ethnicity", "height", "weight",
+  "edu_level", "employment", "marital_status"
+)
+telem_traits_dem <- intake_participants |>
+  left_join(participant_coords, by = join_by(country, geo_area)) |>
+  select(all_of(c("pid", interested_deomographic_cols))) |>
+  right_join(telemetry_traits, by = "pid") |>
+  drop_na()
+
+# average session time for each day of the week
+
+# join daily telemetry up to two weeks prior to the biweekly survey
+# excluding the lower bound, to include the current day of the survey
+wave_daily_telemetry <- biweekly |>
+  left_join(select(intake_participants, pid, adhd), by = "pid") |>
+  # cuts a lot of bangs missingness
+  filter(played_any_games == "Yes") |>
+  select(pid, survey_date = date, wave) |>
+  drop_na() |>
+  mutate(
+    survey_date = as.Date(survey_date),
+    min_twoweek_date = survey_date - weeks(2)
+  ) |>
+  left_join(
+    daily_telemetry,
+    by = join_by(
+      pid,
+      # get daily telemetry up to two weeks before response
+      # excludes survey day (could play more after survey)
+      min_twoweek_date <= day_local,
+      survey_date > day_local
+    ),
+    # account for response delays impacting other responses
+    relationship = "many-to-many"
+  ) |>
+  # start of the week will be Monday
+  # merge mobile instances
+  mutate(
+    day_of_week = lubridate::wday(day_local, week_start = 1),
+    platform = case_when(
+      platform == "iOS" ~ "Mobile",
+      platform == "Android" ~ "Mobile",
+      TRUE ~ platform
+    )
+  ) |>
+  # handle the duplicated "Mobile" rows
+  group_by(across(c(-minutes))) |>
+  summarise(minutes = sum(minutes), .groups = "drop") |>
+  # complete cases (0 for missing days)
+  group_by(pid, wave) |>
+  complete(
+    day_local = seq.Date(
+      first(min_twoweek_date),
+      first(survey_date),
+      by = "day"
+    ),
+    survey_date = first(survey_date),
+    min_twoweek_date = first(min_twoweek_date),
+    platform = c("Mobile", "Steam", "Xbox", "Nintendo"),
+    fill = list(minutes = 0)
+  ) |>
+  ungroup() |>
+  mutate(day_of_week = lubridate::wday(day_local, week_start = 1)) |>
+  filter(!is.na(day_local) & !is.na(platform))
+
+wave_daily_totals <- wave_daily_telemetry |>
+  pivot_wider(
+    names_from = platform,
+    values_from = minutes,
+    names_glue = "{platform}_{.value}",
+  ) |>
+  rename_with(tolower) |>
+  mutate(
+    total_minutes = steam_minutes + xbox_minutes +
+      mobile_minutes + nintendo_minutes
+  )
+
+biweekly_mapper_telemetry <- wave_daily_totals |>
+  group_by(pid, wave) |>
+  summarise(
+    # telemetry frequency
+    days_played = sum(total_minutes > 0),
+    total_wave_minutes = sum(total_minutes),
+    total_steam_minutes = sum(steam_minutes),
+    total_nintendo_minutes = sum(nintendo_minutes),
+    total_xbox_minutes = sum(xbox_minutes),
+    total_mobile_minutes = sum(xbox_minutes),
+    # central tendendencies and spread of telemetry
+    mean_daily_minutes = mean(total_minutes),
+    median_daily_minutes = median(total_minutes),
+    sd_daily_minutes = sd(total_minutes),
+    # hyperfocus/binge metrics
+    max_binge_minutes = max(total_minutes),
+    binge_day_of_week = if_else(
+      max_binge_minutes > 0,
+      day_of_week[which.max(total_minutes)],
+      NA_real_ # unlikely to happen, but check
+    ),
+    # structure of telemetry metrics
+    mean_weekday_minutes = mean(total_minutes[day_of_week %in% 1:5]),
+    mean_weekend_minutes = mean(total_minutes[day_of_week %in% 6:7]),
+    binge_day_of_week = factor(
+      binge_day_of_week,
+      levels = c(1, 2, 3, 4, 5, 6, 7),
+      labels = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+    ),
+    binge_day_of_week = fct_na_value_to_level(binge_day_of_week, level = "None"),
+    # keep pid and wave columns
+    .groups = "drop"
+  )
+
+simon_traits <- simon |>
+  filter(!is.na(meanrt_final)) |>
+  group_by(pid) |>
+  summarise(
+    simon_waves_count = n_distinct(wave),
+    rt_mean = mean(meanrt_final, na.rm = TRUE),
+    rt_sd = ifelse(n() > 1, sd(meanrt_final, na.rm = TRUE), 0),
+    # roc: rate of change (gradient of rt over time)
+    rt_roc = ifelse(
+      n() >= 2,
+      coef(lm(meanrt_final ~ wave))[2],
+      0
+    ),
+    score_mean = mean(score_final, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+biweekly_mapper_data <- biweekly |>
+  left_join(select(intake_participants, pid, adhd), by = "pid") |>
+  filter(!is.na(adhd)) |>
+  mutate(adhd = as.factor(adhd)) |>
+  select(pid, adhd, wave, date, affective_valence, life_sat,
+    starts_with("bangs_"), -starts_with("bangs_dup"), -bangs_failed_att_check,
+    starts_with("gaming_value"),
+    starts_with("wemwbs"),
+    played_any_games
+  ) |>
+  # cuts a lot of bangs missingness
+  filter(played_any_games == "Yes") |>
+  drop_na() |>
+  select(-played_any_games) |>
+  left_join(biweekly_mapper_telemetry, by = join_by(pid, wave)) |>
+  # add reaction time data
+  left_join(simon_traits, by = "pid") |>
+  drop_na()
+
+# Shortlisted, unscaled data
+mapper_data <- biweekly_mapper_data |>
+  mutate(
+    wemwbs_total = rowSums(across(starts_with("wemwbs_")), na.rm = TRUE),
+    bangs_auto_sat = rowSums(across(c(bangs_1, bangs_2, bangs_3)), na.rm = TRUE),
+    bangs_auto_frus = rowSums(across(c(bangs_4, bangs_5, bangs_6)), na.rm = TRUE),
+    bangs_comp_sat = rowSums(across(c(bangs_7, bangs_8, bangs_9)), na.rm = TRUE),
+    bangs_comp_frus = rowSums(across(c(bangs_10, bangs_11, bangs_12)), na.rm = TRUE),
+    bangs_rel_sat = rowSums(across(c(bangs_13, bangs_14, bangs_15)), na.rm = TRUE),
+    bangs_rel_frus = rowSums(across(c(bangs_16, bangs_17, bangs_18)), na.rm = TRUE),
+    gaming_value_sum = rowSums(across(starts_with("gaming_value_")), na.rm = TRUE)
+  ) |>
+  select(
+    aff_val = affective_valence,
+    wemwbs_total,
+    bangs_auto_sat, bangs_auto_frus,
+    bangs_comp_sat, bangs_comp_frus,
+    bangs_rel_sat, bangs_rel_frus,
+    gaming_value_sum,
+    days_played,
+    total_wave_minutes,
+    total_steam_minutes,
+    total_xbox_minutes,
+    total_mobile_minutes,
+    total_xbox_minutes,
+    total_nintendo_minutes,
+    max_binge_minutes,
+    atten_score_mean = score_mean
+  )
+
+# Create reference data for post-construction analysis
+mapper_full_data <- mapper_data |>
+  add_column(
+    pid = biweekly_mapper_data$pid,
+    wave = biweekly_mapper_data$wave
+  ) |>
+  left_join(select(
+    intake_participants,
+    pid,
+    adhd,
+    linked_platforms
+  ), by = "pid") |>
+  mutate(any_adhd = if_else(adhd == "Neurotypical", 0, 1))
+
+# Load the mapper file
+grid_dir <- "examples/open-play/grid_searches"
+mapper_file <- paste(
+  "shortlisted",
+  "more_telem_pca12_covstride_int10_ov50_dbscan_eps0.4_minPts26.json",
+  sep = "/"
+)
+mapper_graph_data <- fromJSON(file.path(here::here(paste(grid_dir, mapper_file, sep = "/"))))
+
+any_adhd <- mapper_full_data$any_adhd
+```
+
+```{r} 
+#| label: data scaling
+#| output: false
+scaler <- "zscale"
+
+# Min-Max Normalisation (commonly used in Kepler Mapper)
+min_max_norm <- function(x) {
+  (x - min(x)) / (max(x) - min(x))
+}
+
+if (scaler == "minmax") {
+  mapper_scaled <- mapper_data |>
+    mutate(across(everything(), min_max_norm))
+} else if (scaler == "zscale") {
+  mapper_scaled <- mapper_data |>
+    mutate(across(everything(), ~ scale(.)[, 1]))
+} else {
+  stop("No valid scaler selected")
+}
+
+mapper_pca <- prcomp(mapper_data, center = TRUE, scale = TRUE)
+# print(xtable::xtable(round(cor(cbind(
+#   mapper_scaled,
+#   pc1 = mapper_pca$x[, 1],
+#   pc2 = mapper_pca$x[, 2]
+# ))[, c("pc1", "pc2")], 2),
+# floating = FALSE, latex.environments = NULL, booktabs = TRUE))
+```
+
+```{r}
+#| label: dimension reduction trials
+#| include: false
+#| eval: false
+
+library(uwot)
+library(Rtsne)
+
+set.seed(30)
+mapper_umap <- umap2(
+  mapper_data,
+  n_components = 2,
+  scale = TRUE,
+  n_neighbors = 10,
+  min_dist = 0.001
+)
+mapper_pca <- prcomp(mapper_data, center = TRUE, scale = TRUE)
+set.seed(30)
+mapper_tsne <- Rtsne(
+  mapper_data,
+  dims = 2,
+  pca_center = TRUE,
+  pca_scale = TRUE
+)
+mapper_dists <- dist(mapper_scaled)
+mapper_mds <- cmdscale(mapper_dists, k = 2)
+
+adhd_group <- mapper_full_data$adhd
+
+dim_red_data <- bind_rows(
+  tibble(
+    method = "pca",
+    dim1 = mapper_pca$x[, 1],
+    dim2 = mapper_pca$x[, 2],
+    adhd = adhd_group
+  ),
+  tibble(
+    method = "tsne",
+    dim1 = mapper_tsne$Y[, 1],
+    dim2 = mapper_tsne$Y[, 2],
+    adhd = adhd_group
+  ),
+  tibble(
+    method = "umap",
+    dim1 = mapper_umap[, 1],
+    dim2 = mapper_umap[, 2],
+    adhd = adhd_group
+  ),
+  tibble(
+    method = "mds",
+    dim1 = mapper_mds[, 1],
+    dim2 = mapper_mds[, 2],
+    adhd = adhd_group
+  )
+)
+
+ggplot(dim_red_data, aes(x = dim1, y = dim2, colour = adhd)) +
+  geom_point(size = 0.3, alpha = 0.6, shape = 1) +
+  facet_wrap(vars(method), scale = "free")
+```
+
+```{r}
+#| label: create mapper
+
+# 10 intervals, 50% overlap
+# DBSCAN(0.4, 26)
+mapper <- MapperAlgo(
+  original_data = mapper_scaled,
+  filter_values = mapper_pca$x[, 1:2],
+  percent_overlap = 50,
+  methods = "dbscan",
+  method_params = list(eps = 0.4, minPts = 26),
+  cover_type = "stride",
+  intervals = 10,
+  num_cores = 10
+)
+# apply index fix
+# mapper$points_in_vertex <- lapply(mapper$points_in_vertex, function(x) x - 1)
+```
+
+```{r}
+#| label: graph any adhd
+pdf("final_mapper_any_adhd.pdf")
+create_mapper_graph(
+  mapper_obj = mapper,
+  colourisation = mapper_full_data$any_adhd,
+  original_data = mapper_data,
+  graph_layout = layout_with_fr,
+  legend = TRUE,
+  legend_title = "Proportion of ADHD Participants",
+  legend_tick_num = 5
+)
+dev.off()
+```
+
+```{r}
+#| label: graph colourisation
+create_mapper_graph(
+  mapper_obj = mapper,
+  colourisation = mapper_data$bangs_auto_sat,
+  original_data = mapper_data,
+  graph_layout = layout_with_fr,
+  legend = TRUE,
+  legend_title = "BANGS Autonomy Satisfaction",
+  legend_tick_num = 5
+)
+```
+
+
+## Analysing the isolated components
+We shall analyse the smaller isolated component:
+```{r}
+#| label: isolated components
+
+isolated_components <- find_isolated_components(mapper_graph_data, mapper_full_data)
+interested_cols <- c(
+  "pid", "wave", "adhd",
+  "wemwbs_total", "life_sat", "aff_val",
+  "bangs_auto_sat", "bangs_auto_frus", "bangs_comp_sat",
+   "bangs_comp_frus", "bangs_rel_sat", "bangs_rel_frus",
+  "gaming_value_sum", "total_wave_minutes", "max_binge_minutes",
+  "binge_day_of_week", "mean_mobile", "mean_nintendo",
+  "mean_steam", "mean_xbox", "score_mean", "atten_score_mean"
+)
+
+print("Full data:")
+print(skimr::skim(mapper_full_data))
+
+# create full game data table
+all_game_telemetry <- bind_rows(
+  steam |>
+    mutate(platform = "Steam") |>
+    select(
+      pid,
+      platform,
+      session_start = approximate_session_start,
+      session_end = approximate_session_end,
+      duration = minutes,
+      title_id
+    ),
+  nintendo |>
+    mutate(platform = "Nintendo") |>
+    select(
+      pid,
+      platform,
+      session_start,
+      session_end,
+      duration,
+      title_id
+    ),
+  # mobile combined
+  bind_rows(ios, android) |>
+    mutate(platform = "Mobile", title_id = NA_character_) |>
+    mutate(duration = sum(minutes), .by = c(pid, day_local)) |>
+    select(
+      pid,
+      platform,
+      session_start = day_local,
+      session_end = day_local,
+      duration,
+      title_id
+    )
+) |>
+  left_join(metadata, by = join_by(platform, title_id == original_name))
+
+xbox_game_telemetry_metadata <- xbox |>
+  mutate(platform = "Xbox") |>
+  select(
+    pid,
+    platform,
+    session_start,
+    session_end,
+    duration,
+    xbox_title_id = title_id
+  ) |>
+  left_join(metadata, by = join_by(
+    platform,
+    xbox_title_id == original_name
+  ))
+
+# TODO: manual game renaming
+game_sessions <- bind_rows(
+  all_game_telemetry,
+  xbox_game_telemetry_metadata
+) |>
+  mutate(
+    primary_genre = case_when(
+      platform == "Xbox" ~ xbox_primary_genre,
+      platform == "Mobile" ~ "Mobile",
+      is.na(genres) ~ NA_character_,
+      TRUE ~ str_split_i(genres, ",", 1)
+    ),
+    secondary_genre = case_when(
+      platform == "Xbox" ~ xbox_subgenre,
+      platform == "Mobile" ~ "Mobile",
+      is.na(genres) ~ NA_character_,
+      TRUE ~ str_split_i(genres, ",", 2)
+    )
+  ) |>
+  select(
+    pid, title_id, platform,
+    session_start, session_end, duration,
+    starts_with("igdb_"), match_confidence,
+    platforms, primary_genre, secondary_genre
+  )
+```
+
+<!-- Component 1: 9 nodes 5 rows -->
+```{r}
+#| label: component 1
+
+comp1_nodes <- isolated_components |>
+  filter(component == 1) |>
+  pull(node)
+unique_rows <- unique(unlist(mapper_graph_data$points_in_vertex[c(comp1_nodes)]))
+comp1_data <- mapper_full_data[unique_rows, ]
+glimpse(comp1_data)
+
+# pdf("isolated_components_pca.pdf")
+# par(
+#   mar = c(3.2, 3.2, 0.8, 0.8), # bottom, left, top, right
+#   mgp = c(1.8, 0.5, 0), # distance for c(axis title, tick labels, tick line)
+#   tcl = -0.3 # slightly shorter tick marks
+# )
+plot(
+  mapper_pca$x[, 1:2],
+  col = "black",
+  pch = 16,
+  cex = 0.6,
+  main = NULL,
+  xlab = "PC1",
+  ylab = "PC2"
+)
+points(
+  mapper_pca$x[unique_rows, 1:2, drop = FALSE],
+  col = "red",
+  pch = 19,
+  cex = 1.2
+)
+# dev.off()
+```
+Five rows of data, 3 from one participant.
+Low affective valence (0, 5, 50 being the one highest) and wellbeing (wemwbs 7-11).
+Very high BANGS autonomy frustration.
+they felt forced into actions and choices, most of which they found boring.
+They always had max scores (21) for BANGS relatedness frustration and very low satisfaction.
+They clearly didn't feel they felt cared for in the games or had connections.
+Their interactions made them feel severely unwelcome and were toxic towards them.
+
+The games they played need investigating.
+```{r} 
+#| label: checking comp 1 games
+
+comp1_pid_info <- comp1_data |>
+  select(pid, wave, linked_platforms) |>
+  left_join(wave_daily_telemetry, by = join_by(pid, wave)) |>
+  select(
+    pid, wave, linked_platforms,
+    wave_start_date = min_twoweek_date,
+    wave_end_date = survey_date
+  ) |>
+  distinct()
+
+# get dates valid for the wave
+comp1_games <- comp1_pid_info |>
+  # steam
+  left_join(game_sessions, by = join_by(
+    pid,
+    wave_start_date <= session_start,
+    wave_end_date > session_end
+  )) |>
+  mutate(
+    minutes_played = sum(duration),
+    .by = c(pid, title_id)
+  ) |>
+  select(-duration) |>
+  distinct(pid, title_id, .keep_all = TRUE)
+```
+
+Game data reveals p3011712557 (neurotypical) had the largest of 2693.7 minutes played in wave 3.
+They played 9 days in this wave with very high gaming influence on social life.
+Max bangs rel frus, comp frus and auto frus.
+They played World and Tanks and Counter Strike 2 during the wave, which explains the high frustrations as they are competitive shooters.
+Participant p1219663417 had 3 waves of data (diagnosed ADHD.)
+Wave 1 showed they just played portal 2 (puzzle game) for 29 minutes across 2 days.
+BANGS rel frus (21), auto frus (19) and low satisfaction across highlights.
+Puzzle games are typically mentally-challenging and single player, so poor relatedness is expected.
+Poor autonomy is also expected -- a puzzle game won't let you continue till you complete the level.
+In wave 3 they played for 470 minutes across five days, playing role playing and beat-em-up games.
+Still believed they couldn't play as they wanted.
+they played for 2700 in wave 5 (CS2=1132 high binge 810, Hundred line=386, multiplayer casual total 280, elden ring 135).
+Participant p7842684564 played 1504 with binge 430.
+Mostly in Souce SDK (1241) and then Schedule 1 (144).
+Source SDK 2007 is a software development kit for creating mods for games on source engine.
+This is not a game as such, rather development/work.
+To summarise: the isolated component consists of participants with negative feelings towards the video games they have been playing, along with very low wemwbs and affective valence scores (outliers).
+
+## Main Structure
+```{r}
+#| label: main structure description
+
+main_nodes <- isolated_components |>
+  filter(component == 2) |>
+  pull(node)
+
+unique_rows <- unique(unlist(mapper_graph_data$points_in_vertex[c(main_nodes)]))
+main_data <- mapper_full_data[unique_rows, ]
+skimr::skim(main_data)
+```
+
+The main structure consists of 72 nodes and more than 900 rows of data.
+There are small tails on the end corners.
+There appears to be an increase in ADHD proportions at the corners.
+As demonstrated through the PCA correlations, we see positive experiences and wellbeing decrease as the the node size decreases.
+
+
+
+## Old version: 30% overlap and less columns
+<!-- Component 2: 4 nodes 1 row -->
+```{r}
+#| label: component 2
+
+comp2_nodes <- isolated_components |>
+  filter(component == 2) |>
+  pull(node)
+unique_rows <- unique(unlist(mapper_graph_data$points_in_vertex[c(comp2_nodes)]))
+comp2_data <- mapper_full_data[unique_rows, ]
+glimpse(comp2_data)
+
+plot(
+  mapper_pca$x[, 1:2],
+  col = "black",
+  pch = 16,
+  cex = 0.6,
+  main = "Component 6 data highlight",
+  xlab = "PC1",
+  ylab = "PC2"
+)
+points(
+  mapper_pca$x[unique_rows, 1:2, drop = FALSE],
+  col = "red",
+  pch = 19,
+  cex = 1.2
+)
+```
+
+The isolated component of 4 nodes consists of only one data point from the biweekly data.
+They are neurotypical, had their highest binge of wave 1 on a Tuesday.
+They played very little during the two weeks (234 minutes).
+As the total wemwbs score for someone saying "some of the time" to the positive questions is 22, they appear to have slightly lower wellbeing, but not noticeably.
+However, they say that gaming has an influce on their life (gaming_value_sum = 26) and is almost classed as an outlier based on the 1.5IQR rule.
+Switching to the gaming value colourisation shows this as red.
+They also show higher BANGS relatedness satisfaction (17), which is significantly higher than average.
+Despite not playing lots during the time, half their wave telemetry was in one session, and the participant felt a strong connection with the players/characters around them.
+As they play steam games, I want to check the metadata for this player, looking into what they generally play...
+
+<!-- Component 3: 1 node 1 point -->
+```{r}
+#| label: component 3
+
+comp3_nodes <- isolated_components |>
+  filter(component == 3) |>
+  pull(node)
+unique_rows <- unique(unlist(mapper_graph_data$points_in_vertex[c(comp3_nodes)]))
+comp3_data <- mapper_full_data[unique_rows, ]
+glimpse(comp3_data)
+plot(
+  mapper_pca$x[, 1:2],
+  col = "black",
+  pch = 16,
+  cex = 0.6,
+  main = "Component 3 data highlight",
+  xlab = "PC1",
+  ylab = "PC2"
+)
+points(
+  mapper_pca$x[unique_rows, 1:2, drop = FALSE],
+  col = "red",
+  pch = 19,
+  cex = 1.2
+)
+```
+
+Another component is a singular node and data point.
+They are a very interesting case:
+low wemwbs (12), life satisfaction (2), affective valence (40), very high autonomy frustration (20), high competence satisfaction (20), very high relatedness frustration (21, the maximum value).
+They played a total of more than 1740 minutes in the two weeks (29 hours), with over 500 minutes in one session.
+Although only on instance and is not actually a high total telemetry, the long session highlights extreme hyperfocus.
+They also achieved a higher attention score of 68.
+The video game type needs to be checked; playing first person shooters may show higher relatedness frustration as players can experience toxic behaviour.
+
+```{r} 
+#| label: checking comp 3 games
+
+comp3_pid_info <- comp5_data |>
+  select(pid, wave, linked_platforms) |>
+  left_join(wave_daily_telemetry, by = join_by(pid, wave)) |>
+  select(pid, wave, linked_platforms, wave_start_date = min_twoweek_date, wave_end_date = survey_date) |>
+  distinct()
+
+# get dates valid for the wave
+comp3_games <- steam |>
+  right_join(comp3_pid_info, by = join_by(
+    pid,
+    approximate_session_start >= wave_start_date,
+    approximate_session_start < wave_end_date
+  )) |>
+  group_by(title_id) |>
+  summarise(minutes_played = sum(minutes)) |>
+  ungroup() |>
+  left_join(metadata, by = join_by(title_id == original_name))
+glimpse(comp3_games)
+```
+This player spent all but one minute of their play time playing "Vampire Surivors", a role-playing survival game hunting vampires.
+
+<!-- Component 5: 1 node 1 row -->
+```{r}
+#| label: component 5
+
+comp5_nodes <- isolated_components |>
+  filter(component == 5) |>
+  pull(node)
+unique_rows <- unique(unlist(mapper_graph_data$points_in_vertex[c(comp5_nodes)]))
+comp5_data <- mapper_full_data[unique_rows, ]
+glimpse(comp5_data)
+plot(
+  mapper_pca$x[, 1:2],
+  col = "black",
+  pch = 16,
+  cex = 0.6,
+  main = "Component 5 data highlight",
+  xlab = "PC1",
+  ylab = "PC2"
+)
+points(
+  mapper_pca$x[unique_rows, 1:2, drop = FALSE],
+  col = "red",
+  pch = 19,
+  cex = 1.2
+)
+```
+
+There is another singular node and data point.
+They are a neurotypical participant and with their total telemetry (687) almost being their highest binge session (686) on a saturday.
+This also exhibits hyperfocus, an ADHD trait.
+But with very few sessions it does not mean they secretly have ADHD.
+They are the 75th percentile in wemwbs (high wellbeing) but have a very low affective valence (20) and life satisfaction (2).
+This is odd, and could be an input error.
+Gaming does not have a large influence on their social life.
+They experience very low satisfactions (3, 3, 3 for all) but also lower frustrations (9, 9 for comp rel).
+Interestingly, they have exceedingly high autonomy frustration.
+With such a large frustration, why do they have a large binge session of more than 11 hours?
+I need to check the game they played, and why the inputs to the survey are odd (just filling it out weirdly, although they didn't fail the check).
+
+<!-- Component 4: 3 nodes 2 rows -->
+```{r}
+#| label: component 4
+
+comp4_nodes <- isolated_components |>
+  filter(component == 4) |>
+  pull(node)
+unique_rows <- unique(unlist(mapper_graph_data$points_in_vertex[c(comp4_nodes)]))
+comp4_data <- mapper_full_data[unique_rows, ]
+glimpse(comp4_data)
+plot(
+  mapper_pca$x[, 1:2],
+  col = "black",
+  pch = 16,
+  cex = 0.6,
+  main = "Component 4 data highlight",
+  xlab = "PC1",
+  ylab = "PC2"
+)
+points(
+  mapper_pca$x[unique_rows, 1:2, drop = FALSE],
+  col = "red",
+  pch = 19,
+  cex = 1.2
+)
+```
+
+An isolated component with 3 nodes and 2 rows of data (from two different participants) contains one diagnosed ADHD participant.
+They are also from two different waves (2 and 3 diagnosed) and have differing wellbeings (20, 10 diagnosed).
+Diagnosed experienced extreme autonomy frustration, and very low satisfaction, but played a lot less than the neurotypical (477 total compared to 5007).
+However, their life satisfaction is low (3, 0 diagnosed) and their affective valence (40, 5 diagnosed).
+
+<!-- Component 6: 2 nodes 3 rows -->
+```{r}
+#| label: component 6
+comp6_nodes <- isolated_components |>
+  filter(component == 6) |>
+  pull(node)
+unique_rows <- unique(unlist(mapper_graph_data$points_in_vertex[c(comp6_nodes)]))
+comp6_data <- mapper_full_data[unique_rows, ]
+glimpse(comp6_data)
+plot(
+  mapper_pca$x[, 1:2],
+  col = "black",
+  pch = 16,
+  cex = 0.6,
+  main = "Component 6 data highlight",
+  xlab = "PC1",
+  ylab = "PC2"
+)
+points(
+  mapper_pca$x[unique_rows, 1:2, drop = FALSE],
+  col = "red",
+  pch = 19,
+  cex = 1.2
+)
+```
+Another component contains just 2 nodes but three participants (one is self-identified ADHD).
+Two are from the second wave, and one from the sixth.
+They have varied affective valence (40, 59, 80) and BANGS.
+However, they have consistent attention scores (the self-identified participant has the attention score in the middle).
+Two of the total wave minutes are similar (1830, 1787) but one is significantl lower (363).
+I cannot find a pattern between the three data points, so I wonder if this is the limitation of using PCA with limited variance.
+Looking at the rotations, I don't see any reason for these data points to be clustered together.

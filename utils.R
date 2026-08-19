@@ -14,3 +14,14 @@ find_mode <- function(x) {
   u <- unique(x)
   u[which.max(tabulate(match(x, u)))]
 }
+
+# show a table in the web browser for better viewing
+show_table <- function(data, ...) {
+  temp_html <- tempfile(pattern = "dt_", fileext = ".html")
+  htmlwidgets::saveWidget(
+    widget = DT::datatable(data, ...),
+    file = temp_html,
+    selfcontained = TRUE
+  )
+  utils::browseURL(temp_html)
+}

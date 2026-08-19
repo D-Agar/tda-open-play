@@ -2,28 +2,42 @@
 # Environment setup
 library(tidyverse)
 library(MapperAlgo)
+library(igraph)
 library(jsonlite)
+library(Rtsne)
+library(uwot)
 
 # Script parameters
-trial_name <- "shorter_pca12"
-scaler <- "minmax"
+data_size <- "more_telem"
+trial_name <- "pca12"
+scaler <- "zscale"
 lenses <- c("PC1", "PC2")
-dir_name <- paste0(trial_name, "_", tolower(scaler))
+dir_name <- paste0(data_size, "_", trial_name, "_", tolower(scaler))
 
 # Grid search parameters
 cover_types <- c("stride")
-intervals_grid <- c(5, 10, 15)
-overlaps_grid <- c(10, 20)
+intervals_grid <- c(10)
+overlaps_grid <- c(40, 50)
 widths_grid <- list(NULL)
 
 # List of clustering methods and their respective hyperparameter sets
 # kNNdistplot(x = mapper_scaled, k = 14) shows k~0.5 is good
 clustering_configs <- list(
-  list(method = "kmeans", params = list(max_kmeans_clusters = 2)),
-  list(method = "kmeans", params = list(max_kmeans_clusters = 3)),
-  list(method = "dbscan", params = list(eps = 0.1, minPts = 5)),
-  list(method = "dbscan", params = list(eps = 0.5, minPts = 3)), # Kepler Mapper Default
-  list(method = "dbscan", params = list(eps = 0.6, minPts = 26))
+  # list(method = "kmeans", params = list(max_kmeans_clusters = 2)),
+  # list(method = "dbscan", params = list(eps = 0.05, minPts = 5)),
+  list(method = "dbscan", params = list(eps = 0.05, minPts = 10)),
+  list(method = "dbscan", params = list(eps = 0.4, minPts = 26)), # calculated version
+  list(method = "dbscan", params = list(eps = 0.1, minPts = 10))
+  # list(method = "dbscan", params = list(eps = 0.2, minPts = 10)),
+  # list(method = "dbscan", params = list(eps = 0.4, minPts = 15)),
+  # list(method = "dbscan", params = list(eps = 0.5, minPts = 15)),
+  # list(method = "dbscan", params = list(eps = 0.5, minPts = 8)),
+  # list(method = "dbscan", params = list(eps = 0.1, minPts = 5)),
+  # list(method = "dbscan", params = list(eps = 0.1, minPts = 3))
+  # list(method = "hierarchical", params = list(method = "single", num_bins_when_clustering = 5))
+  # list(method = "hierarchical", params = list(method = "single", num_bins_when_clustering = 10)),
+  # list(method = "hierarchical", params = list(method = "single", num_bins_when_clustering = 15)),
+  # list(method = "hierarchical", params = list(method = "single", num_bins_when_clustering = 20))
 )
 
 # Generate parameter grid for iteration
@@ -95,36 +109,100 @@ make_mapper_filename <- function(
 }
 
 message("Preparing data and lenses...")
-# Shortlisted, unscaled data
-mapper_data <- biweekly_mapper_data |>
-  mutate(
-    wemwbs_total = rowSums(across(starts_with("wemwbs_")), na.rm = TRUE),
-    bangs_auto_sat = rowSums(across(c(bangs_1, bangs_2, bangs_3)), na.rm = TRUE),
-    bangs_auto_frus = rowSums(across(c(bangs_4, bangs_5, bangs_6)), na.rm = TRUE),
-    bangs_comp_sat = rowSums(across(c(bangs_7, bangs_8, bangs_9)), na.rm = TRUE),
-    bangs_comp_frus = rowSums(across(c(bangs_10, bangs_11, bangs_12)), na.rm = TRUE),
-    bangs_rel_sat = rowSums(across(c(bangs_13, bangs_14, bangs_15)), na.rm = TRUE),
-    bangs_rel_frus = rowSums(across(c(bangs_16, bangs_17, bangs_18)), na.rm = TRUE),
-    gaming_value_sum = rowSums(across(starts_with("gaming_value_")), na.rm = TRUE),
-  ) |>
-  select(
-    wave,
-    aff_val = affective_valence,
-    wemwbs_total,
-    bangs_auto_sat, bangs_auto_frus,
-    bangs_comp_sat, bangs_comp_frus,
-    bangs_rel_sat, bangs_rel_frus,
-    gaming_value_sum,
-    total_wave_minutes,
-    max_binge_minutes,
-    reaction_time_mean = rt_mean
-  )
+if (data_size == "shorter") {
+  # Shortlisted, unscaled data
+  mapper_data <- biweekly_mapper_data |>
+    mutate(
+      wemwbs_total = rowSums(across(starts_with("wemwbs_")), na.rm = TRUE),
+      bangs_auto_sat = rowSums(across(c(bangs_1, bangs_2, bangs_3)), na.rm = TRUE),
+      bangs_auto_frus = rowSums(across(c(bangs_4, bangs_5, bangs_6)), na.rm = TRUE),
+      bangs_comp_sat = rowSums(across(c(bangs_7, bangs_8, bangs_9)), na.rm = TRUE),
+      bangs_comp_frus = rowSums(across(c(bangs_10, bangs_11, bangs_12)), na.rm = TRUE),
+      bangs_rel_sat = rowSums(across(c(bangs_13, bangs_14, bangs_15)), na.rm = TRUE),
+      bangs_rel_frus = rowSums(across(c(bangs_16, bangs_17, bangs_18)), na.rm = TRUE),
+      gaming_value_sum = rowSums(across(starts_with("gaming_value_")), na.rm = TRUE)
+      # log_total_wave_minutes = log1p(total_wave_minutes)
+    ) |>
+    select(
+      wave,
+      aff_val = affective_valence,
+      wemwbs_total,
+      bangs_auto_sat, bangs_auto_frus,
+      bangs_comp_sat, bangs_comp_frus,
+      bangs_rel_sat, bangs_rel_frus,
+      gaming_value_sum,
+      total_wave_minutes,
+      max_binge_minutes,
+      atten_score_mean = score_mean
+    )
+} else if (data_size == "more_telem") {
+  mapper_data <- biweekly_mapper_data |>
+    mutate(
+      wemwbs_total = rowSums(across(starts_with("wemwbs_")), na.rm = TRUE),
+      bangs_auto_sat = rowSums(across(c(bangs_1, bangs_2, bangs_3)), na.rm = TRUE),
+      bangs_auto_frus = rowSums(across(c(bangs_4, bangs_5, bangs_6)), na.rm = TRUE),
+      bangs_comp_sat = rowSums(across(c(bangs_7, bangs_8, bangs_9)), na.rm = TRUE),
+      bangs_comp_frus = rowSums(across(c(bangs_10, bangs_11, bangs_12)), na.rm = TRUE),
+      bangs_rel_sat = rowSums(across(c(bangs_13, bangs_14, bangs_15)), na.rm = TRUE),
+      bangs_rel_frus = rowSums(across(c(bangs_16, bangs_17, bangs_18)), na.rm = TRUE),
+      gaming_value_sum = rowSums(across(starts_with("gaming_value_")), na.rm = TRUE)
+    ) |>
+    select(
+      aff_val = affective_valence,
+      wemwbs_total,
+      bangs_auto_sat, bangs_auto_frus,
+      bangs_comp_sat, bangs_comp_frus,
+      bangs_rel_sat, bangs_rel_frus,
+      gaming_value_sum,
+      days_played,
+      total_wave_minutes,
+      total_steam_minutes,
+      total_xbox_minutes,
+      total_mobile_minutes,
+      total_nintendo_minutes,
+      total_xbox_minutes,
+      max_binge_minutes,
+      atten_score_mean = score_mean
+    )
+} else if (data_size == "wellbeing") {
+  mapper_data <- biweekly_mapper_data |>
+    select(
+      all_of(starts_with("bangs_")),
+      all_of(starts_with("wemwbs_"))
+    )
+} else {
+  # Longer, unscaled data
+  mapper_data <- biweekly_mapper_data |>
+    mutate(
+      wemwbs_total = rowSums(across(starts_with("wemwbs_")), na.rm = TRUE),
+      bangs_auto_sat = rowSums(across(c(bangs_1, bangs_2, bangs_3)), na.rm = TRUE),
+      bangs_auto_frus = rowSums(across(c(bangs_4, bangs_5, bangs_6)), na.rm = TRUE),
+      bangs_comp_sat = rowSums(across(c(bangs_7, bangs_8, bangs_9)), na.rm = TRUE),
+      bangs_comp_frus = rowSums(across(c(bangs_10, bangs_11, bangs_12)), na.rm = TRUE),
+      bangs_rel_sat = rowSums(across(c(bangs_13, bangs_14, bangs_15)), na.rm = TRUE),
+      bangs_rel_frus = rowSums(across(c(bangs_16, bangs_17, bangs_18)), na.rm = TRUE),
+      gaming_value_sum = rowSums(across(starts_with("gaming_value_")), na.rm = TRUE)
+    ) |>
+    rename(atten_score_mean = score_mean) |>
+    select(where(is.numeric))
+}
+
+# mapper_data |>
+#   add_column(biweekly_mapper_data$adhd) |>
+#   rename(adhd = `biweekly_mapper_data$adhd`) |>
+#   ggpairs(aes(colour = adhd, alpha = 0.5))
+
+# ggpairs(
+#   biweekly_mapper_filters,
+#   columns = 2:ncol(biweekly_mapper_filters),
+#   aes(colour = adhd, alpha = 0.5)
+# )
 
 # Create reference data for post-construction analysis
-mapper_full_data <- cbind(
-  biweekly_mapper_data,
-  select(mapper_data, all_of(setdiff(names(mapper_data), names(biweekly_mapper_data))))
-) |>
+mapper_full_data <- mapper_data |>
+  add_column(biweekly_mapper_data$pid) |>
+  rename(pid = `biweekly_mapper_data$pid`) |>
+  left_join(select(intake_participants, pid, adhd), by = "pid") |>
   mutate(any_adhd = if_else(adhd == "Neurotypical", 0, 1))
 
 # Data scaling
@@ -140,12 +218,43 @@ if (scaler == "minmax") {
 } else if (scaler == "zscale") {
   mapper_scaled <- mapper_data |>
     mutate(across(everything(), ~ scale(.)[, 1]))
+} else if (scaler == "none"){
+  mapper_scaled <- mapper_data
 } else {
   stop("No valid scaler selected")
 }
 
 
 # Lens configuration
+
+# Dist mean
+dist_mean <- function(data) {
+  scaled_col_means <- colMeans(data)
+  # the euclidean distance between two single points is just the absolute difference
+  A_dist <- sweep(data, 2, scaled_col_means, "-")
+  rowSums(A_dist^2)
+}
+
+# Create lens/filter functions
+mapper_pca <- prcomp(mapper_data, center = TRUE, scale = TRUE)
+mapper_tsne <- Rtsne(
+  mapper_data,
+  dims = 1,
+  pca_center = TRUE,
+  pca_scale = TRUE
+)
+set.seed(30)
+mapper_umap <- umap2(
+  mapper_data,
+  n_components = 2,
+  scale = TRUE,
+  n_neighbors = 15, # default
+  min_dist = 0.001
+)
+
+# round(cor(cbind(mapper_scaled, pc1 = mapper_pca$x[, 1], pc2 = mapper_pca$x[ , 2]))[, c("pc1", "pc2")], 2)
+
+tsne_vec <- as.vector(mapper_tsne$Y)
 lens_values <- matrix(nrow = nrow(mapper_data), ncol = length(lenses))
 lens_idx <- 0
 for (lens in lenses) {
@@ -153,8 +262,27 @@ for (lens in lenses) {
   # PCA
   if (startsWith(lens, "PC")) {
     component <- as.integer(sub("^PC", "", lens))
-    mapper_short_pca <- prcomp(mapper_data, center = TRUE, scale = TRUE)
-    lens_values[, lens_idx] <- mapper_short_pca$x[, component]
+    lens_values[, lens_idx] <- mapper_pca$x[, component]
+  } else if (startsWith(lens, "umap")) {
+    umap_dim <- as.integer(sub("^umap", "", lens))
+    lens_values[, lens_idx] <- mapper_umap[, umap_dim]
+  } else if (lens == "tsne") {
+    lens_values[, lens_idx] <- as.vector(mapper_tsne$Y)
+  } else if (lens == "adhd_binary") {
+    lens_values[, lens_idx] <- ifelse(biweekly_mapper_data$adhd == "Diagnosed ADHD", 1, 0)
+  } else if (lens == "eccentricity") {
+    # distances on scaled data
+    mapper_dists <- as.matrix(dist(mapper_scaled, method = "euclidean"))
+    lens_values[, lens_idx] <- apply(mapper_dists, 1, max)
+  } else if (lens == "xgb") {
+    lens_values[, lens_idx] <- biweekly_mapper_filters$xgb_adhd_pred
+  } else if (lens == "dist_mean") {
+    lens_values[, lens_idx] <- dist_mean(mapper_scaled)
+  } else if (lens == "density_estimation") {
+    lens_values[, lens_idx] <- as.vector(density_estimation(dist(mapper_scaled))$values)
+  } else if (startsWith(lens, "col_")) {
+    column <- sub("^col_", "", lens)
+    lens_values[, lens_idx] <- mapper_data[[column]]
   }
 }
 
@@ -171,7 +299,7 @@ for (i in seq_len(total_runs)) {
 
   # Build destination filename and path
   filename <- make_mapper_filename(
-    mapper_name = trial_name,
+    mapper_name = paste0(data_size, "_", trial_name),
     cover_type = cov,
     intervals = int_val,
     overlap = ov,
@@ -180,10 +308,10 @@ for (i in seq_len(total_runs)) {
     method_params = cur_params,
     ext = "json"
   )
-  target_file <- file.path(mapper_trials_dir, filename)
+  target_file <- here::here(mapper_trials_dir, filename)
 
   # Skip already computed runs
-  if (file.exists(target_file)) {
+  if (file.exists(here::here(target_file))) {
     message(sprintf(
       "[%d/%d] Skipping existing run: %s",
       i,
@@ -214,6 +342,8 @@ for (i in seq_len(total_runs)) {
         adjacency = mapper_out$adjacency,
         num_vertices = mapper_out$num_vertices,
         level_of_vertex = mapper_out$level_of_vertex,
+        # Subtract 1 from every point index: MAJOR BUG IN MAPPERALGO
+        # points_in_vertex = lapply(mapper_out$points_in_vertex, function(x) x - 1),
         points_in_vertex = mapper_out$points_in_vertex,
         original_data = mapper_full_data
       )

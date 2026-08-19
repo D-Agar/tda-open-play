@@ -10,7 +10,7 @@ density_estimation <- function(d_matrix, epsilon = NULL) {
     # Number of features/dimensions
     d <- ncol(d_matrix)
     med_dist <- median(d_matrix[upper.tri(d_matrix)])
-    
+
     # Approximate a dimension-adjusted bandwidth, then square it for your formula
     bandwidth <- med_dist * (4 / (d + 2))^(1 / (d + 4))
     epsilon <- 2 * (bandwidth^2)
@@ -18,7 +18,7 @@ density_estimation <- function(d_matrix, epsilon = NULL) {
 
   # exponential kernel component (Gaussian)
   kernel_matrix <- exp(-d_matrix_sq / epsilon)
-  
+
   # sum over each point
   sum_y <- rowSums(kernel_matrix)
 
@@ -34,7 +34,7 @@ density_estimation <- function(d_matrix, epsilon = NULL) {
 
 calculate_eccentricity <- function(d_matrix, exponent = 2) {
   # row-wise vector norms
-  row_norm <- (abs(d_matrix)^exponent)^(1/exponent)
+  row_norm <- (abs(d_matrix)^exponent)^(1 / exponent)
   norm_sums <- rowSums(row_norm)
 
   # keep dimensions
