@@ -14,8 +14,16 @@ create_mapper_graph <- function(
   # create a mapper graph, with node sizes, colours, and the option for nodes to be pie charts
   g <- graph_from_adjacency_matrix(mapper_obj$adjacency, mode = "undirected")
 
+  # detect 0-indexed JSON (from previous fix)
+  all_indices <- unlist(mapper_obj$points_in_vertex)
+  is_zero_indexed <- length(all_indices) > 0 && min(all_indices, na.rm = TRUE) == 0
+
+  pts_list <- lapply(mapper_obj$points_in_vertex, function(idx) {
+    if (is_zero_indexed) idx + 1 else idx
+  })
+
   # node size is a constant + sqrt(node size)
-  node_counts <- sapply(mapper_obj$points_in_vertex, length)
+  node_counts <- sapply(pts_list, length)
   V(g)$size <- 2 + sqrt(node_counts)
 
   is_colourisation_categorical <- is.character(colourisation) || is.factor(colourisation)
@@ -24,8 +32,16 @@ create_mapper_graph <- function(
     colourisation <- as.factor(colourisation)
     cat_levels <- levels(colourisation)
 
-    mode_colours <- sapply(mapper_obj$points_in_vertex, function(indices) {
+    mode_colours <- sapply(pts_list, function(indices) {
+      indices <- indices[!is.na(indices) & indices > 0]
+      if (length(indices) == 0) {
+        return(NA_character_)
+      }
       vals <- colourisation[indices]
+      vals <- vals[!is.na(vals)]
+      if (length(vals) == 0) {
+        return(NA_character_)
+      }
       u <- unique(vals)
       as.character(u[which.max(tabulate(match(vals, u)))])
     })
@@ -38,17 +54,25 @@ create_mapper_graph <- function(
     # node colour is the lens value (by default)
     colourisation <- as.matrix(colourisation)
     # Euclidean distance magnitude from the center across dimensions
-    mean_colours <- sapply(mapper_obj$points_in_vertex, function(indices) {
-      # column averages for this specific node block
-      dim_means <- colMeans(colourisation[indices, , drop = FALSE])
+    mean_colours <- sapply(pts_list, function(indices) {
+      indices <- indices[!is.na(indices) & indices > 0]
+      if (length(indices) == 0) {
+        return(0)
+      }
+      sub_mat <- colourisation[indices, , drop = FALSE]
+      dim_means <- colMeans(sub_mat, na.rm = TRUE)
+      dim_means[is.nan(dim_means) | is.na(dim_means)] <- 0
       return(sqrt(sum(dim_means^2)))
     })
+
+    min_val <- min(mean_colours, na.rm = TRUE)
+    max_val <- max(mean_colours, na.rm = TRUE)
     val_range <- max(mean_colours) - min(mean_colours)
     # avoid division by zero if all mean lens values are the same (range = 0)
-    if (val_range == 0) {
-      scaled_vals <- rep(0.5, length(mean_colours)) # no variance
+    if (is.na(val_range) || is.nan(val_range) || val_range == 0) {
+      scaled_vals <- rep(0.5, length(mean_colours))
     } else {
-      scaled_vals <- (mean_colours - min(mean_colours)) / val_range
+      scaled_vals <- (mean_colours - min_val) / val_range
     }
 
     # colour gradient from blue to yellow to red

@@ -6,35 +6,48 @@ library(igraph)
 library(jsonlite)
 library(Rtsne)
 library(uwot)
+library(dbscan)
 
 # Script parameters
 data_size <- "more_telem"
-trial_name <- "pca12"
+trial_name <- "pca12_final"
 scaler <- "zscale"
 lenses <- c("PC1", "PC2")
 dir_name <- paste0(data_size, "_", trial_name, "_", tolower(scaler))
 
 # Grid search parameters
-cover_types <- c("stride")
+cover_types <- c("extension")
 intervals_grid <- c(10)
 overlaps_grid <- c(40, 50)
 widths_grid <- list(NULL)
 
+# options(scipen = 10)
+# hist(
+#   dist(mapper_scaled),
+#   main = "Min-Max Mapper distances",
+#   xlab = "Distance",
+#   ylab = "Frequency"
+# )
+# pdf("knn_distplot_minmax.pdf")
 # List of clustering methods and their respective hyperparameter sets
-# kNNdistplot(x = mapper_scaled, k = 14) shows k~0.5 is good
+# kNNdistplot(x = mapper_scaled, k = 34) # shows k~0.5 is good
+# dev.off()
+
 clustering_configs <- list(
   # list(method = "kmeans", params = list(max_kmeans_clusters = 2)),
-  # list(method = "dbscan", params = list(eps = 0.05, minPts = 5)),
-  list(method = "dbscan", params = list(eps = 0.05, minPts = 10)),
-  list(method = "dbscan", params = list(eps = 0.4, minPts = 26)), # calculated version
-  list(method = "dbscan", params = list(eps = 0.1, minPts = 10))
+  # list(method = "dbscan", params = list(eps = 0.05, minPts = 3))
+  # list(method = "dbscan", params = list(eps = 0.05, minPts = 10)),
+  # list(method = "dbscan", params = list(eps = 2.5, minPts = 5))
+  list(method = "dbscan", params = list(eps = 3, minPts = 5))
+  # list(method = "dbscan", params = list(eps = 0.4, minPts = 5)) # calculated version
+  # list(method = "dbscan", params = list(eps = 0.1, minPts = 10))
   # list(method = "dbscan", params = list(eps = 0.2, minPts = 10)),
   # list(method = "dbscan", params = list(eps = 0.4, minPts = 15)),
   # list(method = "dbscan", params = list(eps = 0.5, minPts = 15)),
   # list(method = "dbscan", params = list(eps = 0.5, minPts = 8)),
   # list(method = "dbscan", params = list(eps = 0.1, minPts = 5)),
   # list(method = "dbscan", params = list(eps = 0.1, minPts = 3))
-  # list(method = "hierarchical", params = list(method = "single", num_bins_when_clustering = 5))
+  # list(method = "hierarchical", params = list(method = "single", num_bins_when_clustering = 5)),
   # list(method = "hierarchical", params = list(method = "single", num_bins_when_clustering = 10)),
   # list(method = "hierarchical", params = list(method = "single", num_bins_when_clustering = 15)),
   # list(method = "hierarchical", params = list(method = "single", num_bins_when_clustering = 20))
@@ -60,7 +73,7 @@ if (!dir.exists(mapper_trials_dir)) {
 
 message("Loading base mapper data...")
 if (!exists("biweekly_mapper_data")) {
-  load(file = "temp/mapper_trials.RData")
+  source("examples/open-play/mapper_data.R")
 }
 
 make_mapper_filename <- function(
@@ -160,7 +173,6 @@ if (data_size == "shorter") {
       total_xbox_minutes,
       total_mobile_minutes,
       total_nintendo_minutes,
-      total_xbox_minutes,
       max_binge_minutes,
       atten_score_mean = score_mean
     )
@@ -218,7 +230,7 @@ if (scaler == "minmax") {
 } else if (scaler == "zscale") {
   mapper_scaled <- mapper_data |>
     mutate(across(everything(), ~ scale(.)[, 1]))
-} else if (scaler == "none"){
+} else if (scaler == "none") {
   mapper_scaled <- mapper_data
 } else {
   stop("No valid scaler selected")
