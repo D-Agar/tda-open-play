@@ -830,8 +830,9 @@ p_pairs <- ggpairs(
   ),
   legend = c(1, 1) # legend from first plot
 ) +
-  scale_color_brewer(palette = "Dark2", name = "ADHD Status") +
-  scale_fill_brewer(palette = "Dark2", name = "ADHD Status") +
+  # scale_color_brewer(palette = "Dark2", name = "ADHD Status") +
+  # scale_fill_brewer(palette = "Dark2", name = "ADHD Status") +
+  labs(colour = "ADHD Status", fill = "ADHD Status") +
   theme_bw(base_size = 9, base_family = "sans") +
   theme(
     strip.background = element_rect(fill = "grey95", color = "grey80"),

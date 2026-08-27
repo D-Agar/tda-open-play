@@ -59,3 +59,4 @@ rsconnect/
 
 # Mapper grid searching
 **/grid_searches*/
+/mapper_analysis_figs

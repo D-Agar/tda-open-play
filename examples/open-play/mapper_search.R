@@ -10,35 +10,23 @@ library(dbscan)
 
 # Script parameters
 data_size <- "more_telem"
-trial_name <- "pca12_final"
+trial_name <- "alt_final_dist_wemwbs"
 scaler <- "zscale"
-lenses <- c("PC1", "PC2")
+lenses <- c("dist_mean", "col_wemwbs_total")
 dir_name <- paste0(data_size, "_", trial_name, "_", tolower(scaler))
 
 # Grid search parameters
 cover_types <- c("extension")
 intervals_grid <- c(10)
-overlaps_grid <- c(40, 50)
+overlaps_grid <- c(40)
 widths_grid <- list(NULL)
 
-# options(scipen = 10)
-# hist(
-#   dist(mapper_scaled),
-#   main = "Min-Max Mapper distances",
-#   xlab = "Distance",
-#   ylab = "Frequency"
-# )
-# pdf("knn_distplot_minmax.pdf")
-# List of clustering methods and their respective hyperparameter sets
-# kNNdistplot(x = mapper_scaled, k = 34) # shows k~0.5 is good
-# dev.off()
-
 clustering_configs <- list(
-  # list(method = "kmeans", params = list(max_kmeans_clusters = 2)),
+  list(method = "kmeans", params = list(max_kmeans_clusters = 2)),
   # list(method = "dbscan", params = list(eps = 0.05, minPts = 3))
   # list(method = "dbscan", params = list(eps = 0.05, minPts = 10)),
   # list(method = "dbscan", params = list(eps = 2.5, minPts = 5))
-  list(method = "dbscan", params = list(eps = 3, minPts = 5))
+  list(method = "dbscan", params = list(eps = 3, minPts = 5)),
   # list(method = "dbscan", params = list(eps = 0.4, minPts = 5)) # calculated version
   # list(method = "dbscan", params = list(eps = 0.1, minPts = 10))
   # list(method = "dbscan", params = list(eps = 0.2, minPts = 10)),
@@ -47,10 +35,10 @@ clustering_configs <- list(
   # list(method = "dbscan", params = list(eps = 0.5, minPts = 8)),
   # list(method = "dbscan", params = list(eps = 0.1, minPts = 5)),
   # list(method = "dbscan", params = list(eps = 0.1, minPts = 3))
-  # list(method = "hierarchical", params = list(method = "single", num_bins_when_clustering = 5)),
-  # list(method = "hierarchical", params = list(method = "single", num_bins_when_clustering = 10)),
-  # list(method = "hierarchical", params = list(method = "single", num_bins_when_clustering = 15)),
-  # list(method = "hierarchical", params = list(method = "single", num_bins_when_clustering = 20))
+  list(method = "hierarchical", params = list(method = "single", num_bins_when_clustering = 5)),
+  list(method = "hierarchical", params = list(method = "single", num_bins_when_clustering = 10)),
+  list(method = "hierarchical", params = list(method = "single", num_bins_when_clustering = 15)),
+  list(method = "hierarchical", params = list(method = "single", num_bins_when_clustering = 20))
 )
 
 # Generate parameter grid for iteration
@@ -205,15 +193,17 @@ if (data_size == "shorter") {
 #   ggpairs(aes(colour = adhd, alpha = 0.5))
 
 # ggpairs(
-#   biweekly_mapper_filters,
-#   columns = 2:ncol(biweekly_mapper_filters),
+#   mapper_filters,
+#   columns = 2:ncol(mapper_filters),
 #   aes(colour = adhd, alpha = 0.5)
 # )
 
 # Create reference data for post-construction analysis
 mapper_full_data <- mapper_data |>
-  add_column(biweekly_mapper_data$pid) |>
-  rename(pid = `biweekly_mapper_data$pid`) |>
+  add_column(
+    pid = biweekly_mapper_data$pid,
+    wave = biweekly_mapper_data$wave
+  ) |>
   left_join(select(intake_participants, pid, adhd), by = "pid") |>
   mutate(any_adhd = if_else(adhd == "Neurotypical", 0, 1))
 
@@ -287,7 +277,7 @@ for (lens in lenses) {
     mapper_dists <- as.matrix(dist(mapper_scaled, method = "euclidean"))
     lens_values[, lens_idx] <- apply(mapper_dists, 1, max)
   } else if (lens == "xgb") {
-    lens_values[, lens_idx] <- biweekly_mapper_filters$xgb_adhd_pred
+    lens_values[, lens_idx] <- mapper_filters$xgb_adhd_pred
   } else if (lens == "dist_mean") {
     lens_values[, lens_idx] <- dist_mean(mapper_scaled)
   } else if (lens == "density_estimation") {

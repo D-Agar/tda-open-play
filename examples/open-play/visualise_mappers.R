@@ -77,6 +77,7 @@ generate_mapper_figures <- function(source_dir = ".", output_dir = NULL) {
 
       pdf(output_pdf_path)
       # create graph with adhd proportions as colour scale
+      set.seed(2)
       create_mapper_graph(
         mapper_obj = mapper_json,
         colourisation = mapper_full_data$any_adhd,

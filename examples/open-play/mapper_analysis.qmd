@@ -14,19 +14,27 @@ format:
 #| include: false
 #| output: false
 #| code-summary: "Show code (Load required R packages)"
+
+source("renv/activate.R")
 library(tidyverse)
 library(MapperAlgo)
 library(igraph)
 library(jsonlite)
 library(knitr) # latex tables
+library(skimr)
+library(dbscan)
+library(janitor)
 
-generate_pdf_figs <- TRUE
+generate_pdf_figs <- FALSE
 theme_set(theme_minimal())
 source("examples/open-play/helpers.R")
 source("utils.R")
 
 sourceDir("mapper", exclude = "test.R")
 source("examples/open-play/mapper_data.R")
+
+mapper_full_data <- mapper_full_data |>
+  mutate(adhd = as.factor(adhd))
 ```
 
 ```{r}
@@ -53,16 +61,6 @@ mapper_file <- paste(
 mapper_graph_data <- fromJSON(here::here(paste(grid_dir, mapper_file, sep = "/")))
 
 any_adhd <- mapper_full_data$any_adhd
-# checking data for index issues
-raw_indices <- unlist(mapper_graph_data$points_in_vertex)
-is_zero_indexed <- min(raw_indices, na.rm = TRUE) == 0
-assigned_rows <- unique(if (is_zero_indexed) raw_indices + 1 else raw_indices)
-total_rows    <- nrow(mapper_full_data)
-unassigned_rows <- setdiff(seq_len(total_rows), assigned_rows)
-message(sprintf(
-  "Total Rows: %d | Assigned: %d | Excluded (DBSCAN Noise / Outliers): %d",
-  total_rows, length(assigned_rows), length(unassigned_rows)
-))
 ```
 
 ```{r} 
@@ -157,6 +155,7 @@ ggplot(dim_red_data, aes(x = dim1, y = dim2, colour = adhd)) +
 if (generate_pdf_figs) dev.off()
 ```
 
+# Mapper Graph
 ```{r}
 #| label: create mapper
 
@@ -185,7 +184,8 @@ mapper_dists <- as.numeric(mapper_dists)
 
 if (generate_pdf_figs) pdf("mapper_analysis_figs/mapper_scaled_dists_hist.pdf")
 ggplot(data.frame(distance = mapper_dists), aes(x = distance)) +
-  geom_histogram(colour = "black", bins = 20) +
+  geom_histogram(color = "black", bins = 20) +
+  geom_vline(xintercept = 3, colour = "red") +
   scale_x_continuous(breaks = seq(0, 25, 5))
 if (generate_pdf_figs) dev.off()
 
@@ -200,6 +200,9 @@ Looking at these plots and changing k in the 'kNNdistplot' gives eps~3 a good ch
 
 ```{r}
 #| label: graph any adhd
+
+# important keep the seed
+set.seed(2)
 if (generate_pdf_figs) pdf("mapper_analysis_figs/final_mapper_any_adhd.pdf")
 create_mapper_graph(
   mapper_obj = mapper_graph_data,
@@ -215,39 +218,39 @@ if (generate_pdf_figs) dev.off()
 
 ```{r}
 #| label: graph colourisation
-if (generate_pdf_figs) pdf("mapper_analysis_figs/final_mapper_bangs_auto_sat.pdf")
+
+# bangs comp sat: strongest correlation with PC1
+set.seed(2)
+if (generate_pdf_figs) pdf("mapper_analysis_figs/final_mapper_bangs_comp_sat.pdf")
 create_mapper_graph(
   mapper_obj = mapper_graph_data,
-  colourisation = mapper_data$bangs_auto_sat,
+  colourisation = mapper_data$bangs_comp_sat,
   original_data = mapper_data,
   graph_layout = layout_with_fr,
   legend = TRUE,
-  legend_title = "BANGS Autonomy Satisfaction",
+  legend_title = "BANGS Competence Satisfaction",
+  legend_tick_num = 5
+)
+if (generate_pdf_figs) dev.off()
+
+set.seed(2)
+# total wave minutes: strongest correlation with PC2
+if (generate_pdf_figs) pdf("mapper_analysis_figs/final_mapper_total_wave_minutes.pdf")
+create_mapper_graph(
+  mapper_obj = mapper_graph_data,
+  colourisation = mapper_data$total_wave_minutes,
+  original_data = mapper_data,
+  graph_layout = layout_with_fr,
+  legend = TRUE,
+  legend_title = "Total wave playtime (minutes)",
   legend_tick_num = 5
 )
 if (generate_pdf_figs) dev.off()
 ```
 
-```{r}
-#| label: mapper data points
 
-# checking data for index issues
-raw_indices <- unlist(mapper_graph_data$points_in_vertex)
-is_zero_indexed <- min(raw_indices, na.rm = TRUE) == 0
-assigned_rows <- unique(if (is_zero_indexed) raw_indices + 1 else raw_indices)
-total_rows    <- nrow(mapper_full_data)
-unassigned_rows <- setdiff(seq_len(total_rows), assigned_rows)
-message(sprintf(
-  "Total Rows: %d | Assigned: %d | Excluded (DBSCAN Noise / Outliers): %d",
-  total_rows, length(assigned_rows), length(unassigned_rows)
-))
-noise_participants <- mapper_full_data[unassigned_rows, ]
-```
-
-## Analysing the isolated components
-We shall analyse the smaller isolated component:
 ```{r}
-#| label: isolated components
+#| label: game metadata and isolated components
 
 isolated_components <- find_isolated_components(mapper_graph_data, mapper_full_data)
 
@@ -274,7 +277,7 @@ interested_cols <- c(
 )
 
 print("Full data:")
-print(skimr::skim(mapper_full_data))
+print(skim(mapper_full_data))
 
 # create full game data table
 all_game_telemetry <- bind_rows(
@@ -344,7 +347,7 @@ game_sessions <- bind_rows(
       platform == "Xbox" ~ xbox_subgenre,
       platform == "Mobile" ~ "Mobile",
       is.na(genres) ~ NA_character_,
-      TRUE ~ str_split_i(genres, ",", 2)
+      TRUE ~ trimws(str_split_i(genres, ",", 2))
     )
   ) |>
   select(
@@ -353,25 +356,250 @@ game_sessions <- bind_rows(
     starts_with("igdb_"), match_confidence,
     platforms, primary_genre, secondary_genre
   )
+
+mapper_data_participants <- biweekly_mapper_data |>
+  left_join(intake_participants, by = "pid")
 ```
 
-<!-- Component 1: 9 nodes 5 rows -->
 ```{r}
-#| label: component 1
+#| label: game genre colour scales
 
-comp1_nodes <- isolated_components |>
-  filter(component == 1) |>
+game_sessions |> count(primary_genre, sort = TRUE) |> print(n = Inf)
+game_sessions |> count(secondary_genre, sort = TRUE) |> print(n = Inf)
+
+# proportions of a mapper row's telemetry playing different genres
+genre_maps <- tribble(
+  ~from, ~to,
+  c("Card & Board Game", "Card + Board"), "Card & Board",
+  c("Platform", "Platformer"), "Platformer",
+  c("Puzzle", "Puzzle + Trivia", "Quiz/Trivia"), "Puzzle & Trivia",
+  c("Racing", "Racing + Flying"), "Racing",
+  c("Role Playing", "Role-playing (RPG)"), "Role-Playing (RPG)",
+  c("Simulation", "Simulator"), "Simulation",
+  c("Sport", "Sports"), "Sports",
+  c("Real Time Strategy (RTS)", "Strategy", "Tactical"), "Strategy",
+  c("Multi-Player Online Battle Arena"), "MOBA"
+)
+
+biweekly_genres <- mapper_full_data |>
+  select(pid, wave, linked_platforms) |>
+  left_join(wave_daily_telemetry, by = join_by(pid, wave)) |>
+  select(
+    pid, wave, linked_platforms,
+    wave_start_date = min_twoweek_date,
+    wave_end_date = survey_date
+  ) |>
+  distinct() |>
+  left_join(game_sessions, by = join_by(
+    pid,
+    wave_start_date <= session_start,
+    wave_end_date > session_end
+  )) |>
+  mutate(
+    clean_genre = replace_values(
+      primary_genre,
+      from = genre_maps$from,
+      to = genre_maps$to
+    )
+  ) |>
+  summarise(
+    wave_minutes_played = sum(duration, na.rm = TRUE),
+    .by = c(pid, wave, clean_genre)
+  ) |>
+  complete(
+    nesting(pid, wave),
+    clean_genre = unique(na.omit(clean_genre)),
+    fill = list(wave_minutes_played = 0)
+  ) |>
+  filter(!is.na(clean_genre)) |>
+  mutate(
+    total_wave_minutes = sum(wave_minutes_played),
+    genre_wave_prop = if_else(
+      total_wave_minutes > 0,
+      wave_minutes_played / total_wave_minutes,
+      0
+    ),
+    .by = c(pid, wave)
+  ) |>
+  select(-total_wave_minutes)
+
+biweekly_genre_wider <- biweekly_genres |>
+  select(pid, wave, clean_genre, genre_wave_prop) |>
+  pivot_wider(
+    names_from = clean_genre,
+    names_prefix = "prop",
+    values_from = genre_wave_prop,
+    values_fill = 0
+  ) |>
+  clean_names()
+
+mapper_full_data <- mapper_full_data |>
+  left_join(biweekly_genre_wider)
+```
+
+## Graph Data
+
+```{r}
+node_sizes <- lapply(mapper_graph_data$points_in_vertex, length)
+unlist_node_sizes <- unlist(node_sizes)
+node_sizes[order(unlist(node_sizes))]
+```
+
+## Clustered Data
+```{r}
+#| label: mapper data points
+
+# checking data for index issues
+raw_indices <- unlist(mapper_graph_data$points_in_vertex)
+is_zero_indexed <- min(raw_indices, na.rm = TRUE) == 0
+assigned_rows <- unique(if (is_zero_indexed) raw_indices + 1 else raw_indices)
+total_rows    <- nrow(mapper_full_data)
+unassigned_rows <- setdiff(seq_len(total_rows), assigned_rows)
+message(sprintf(
+  "Total Rows: %d | Assigned: %d | Excluded (DBSCAN Noise / Outliers): %d",
+  total_rows, length(assigned_rows), length(unassigned_rows)
+))
+noise_participants <- mapper_full_data[unassigned_rows, ]
+clustered_participants <- mapper_full_data[-unassigned_rows,]
+mapper_full_data$noise <- FALSE
+mapper_full_data[unassigned_rows, "noise"] <- TRUE
+```
+The nature of DBSCAN excludes noise.
+The algorithm classed 166 of the 5836 points as noise.
+
+```{r}
+#| label: dbscan noise pca plot
+
+if (generate_pdf_figs) {
+  pdf("mapper_analysis_figs/noise_pca_data.pdf")
+  par(
+    mar = c(3.2, 3.2, 0.8, 0.8), # bottom, left, top, right
+    mgp = c(1.8, 0.5, 0), # distance for c(axis title, tick labels, tick line)
+    tcl = -0.3 # slightly shorter tick marks
+  )
+}
+plot(
+  mapper_pca$x[, 1:2],
+  col = "black",
+  pch = 16,
+  cex = 0.6,
+  main = NULL,
+  xlab = "PC1",
+  ylab = "PC2"
+)
+points(
+  mapper_pca$x[unassigned_rows, 1:2, drop = FALSE],
+  col = "red",
+  pch = 19,
+  cex = 1.2
+)
+if (generate_pdf_figs) dev.off()
+```
+
+The noise appears to be spread more over PC2, which correlates most with telemetry data.
+I will check the distributions of the telemetry data.
+
+```{r}
+#| label: plotting telemetry distributions
+
+telemetry_cols <- c(
+  "total_wave_minutes", "total_steam_minutes",
+  "total_xbox_minutes", "total_mobile_minutes",
+  "total_nintendo_minutes", "max_binge_minutes",
+  "days_played"
+)
+mapper_full_data |>
+  pivot_longer(
+    cols = all_of(telemetry_cols),
+    names_to = "metric",
+    values_to = "value"
+  ) |>
+  ggplot(aes(x = value, fill = as.factor(noise))) +
+  geom_density(alpha = 0.3) +
+  facet_wrap(vars(metric), scales = "free") +
+  labs(
+    x = "Value",
+    y = "Density",
+    fill = "Noise",
+  )
+
+wellbeing_cols <- c(
+  "aff_val", "wemwbs_total",
+  "bangs_auto_sat", "bangs_auto_frus",
+  "bangs_comp_sat", "bangs_comp_frus",
+  "bangs_rel_sat", "bangs_rel_frus",
+  "gaming_value_sum"
+)
+mapper_full_data |>
+  pivot_longer(
+    cols = all_of(wellbeing_cols),
+    names_to = "metric",
+    values_to = "value"
+  ) |>
+  ggplot(aes(x = value, fill = as.factor(noise))) +
+  geom_density(alpha = 0.3) +
+  facet_wrap(vars(metric), scales = "free") +
+  labs(
+    x = "Value",
+    y = "Density",
+    fill = "Noise"
+  )
+```
+
+The outliers appear to show less general playtime and less frustrations with games.
+However, we must consider the significant difference in sample sizes.
+
+```{r}
+mat_scaled <- as.matrix(mapper_scaled)
+feature_blame <- purrr::map_dfr(unassigned_rows, function(i) {
+  # squared distances
+  diffs_sq <- sweep(mat_scaled[-i, , drop = FALSE], 2, mat_scaled[i, ], "-")^2
+  total_dists <- sqrt(rowSums(diffs_sq))
+  
+  nearest_idx <- which.min(total_dists)
+  sq_contrib <- diffs_sq[nearest_idx, ]
+  
+  tibble(
+    noise_point_id = i,
+    closest_dist = total_dists[nearest_idx],
+    top_driver = names(which.max(sq_contrib)),
+    top_driver_share = max(sq_contrib) / sum(sq_contrib)
+  )
+})
+
+# See which features most frequently push points outside the eps radius
+table(feature_blame$top_driver)
+
+# assessing affective valence differences
+# testing variances (homoscedasticity)
+var.test(clustered_participants$aff_val, noise_participants$aff_val)
+aff_val_noise_test <- t.test(clustered_participants$aff_val, noise_participants$aff_val, var.equal = FALSE)
+print(aff_val_noise_test)
+```
+
+## Isolated Components
+The graph shows one large structure,
+which shall be the topic of the analysis.
+There is however one isolated point in the space.
+<!-- Component 2: 1 node, 1 row -->
+```{r}
+#| label: component 2
+
+comp2_nodes <- isolated_components |>
+  filter(component == 2) |>
   pull(node)
-unique_rows <- unique(unlist(mapper_graph_data$points_in_vertex[c(comp1_nodes)]))
-comp1_data <- mapper_full_data[unique_rows, ]
-glimpse(comp1_data)
+unique_rows <- unique(unlist(mapper_graph_data$points_in_vertex[c(comp2_nodes)]))
+comp2_data <- mapper_full_data[unique_rows, ]
+glimpse(comp2_data)
 
-# pdf("isolated_components_pca.pdf")
-# par(
-#   mar = c(3.2, 3.2, 0.8, 0.8), # bottom, left, top, right
-#   mgp = c(1.8, 0.5, 0), # distance for c(axis title, tick labels, tick line)
-#   tcl = -0.3 # slightly shorter tick marks
-# )
+if (generate_pdf_figs) {
+  pdf("mapper_analysis_figs/comp2_pca_data.pdf")
+  par(
+    mar = c(3.2, 3.2, 0.8, 0.8), # bottom, left, top, right
+    mgp = c(1.8, 0.5, 0), # distance for c(axis title, tick labels, tick line)
+    tcl = -0.3 # slightly shorter tick marks
+  )
+}
 plot(
   mapper_pca$x[, 1:2],
   col = "black",
@@ -387,21 +615,30 @@ points(
   pch = 19,
   cex = 1.2
 )
-# dev.off()
+if (generate_pdf_figs) dev.off()
+
+# mapper graph visualised by age
+create_mapper_graph(
+  mapper_obj = mapper_graph_data,
+  colourisation = mapper_data_participants$age,
+  original_data = mapper_data,
+  graph_layout = layout_with_fr,
+  legend = TRUE,
+  legend_title = "Participant Age",
+  legend_tick_num = 5
+)
 ```
-Five rows of data, 3 from one participant.
-Low affective valence (0, 5, 50 being the one highest) and wellbeing (wemwbs 7-11).
-Very high BANGS autonomy frustration.
-they felt forced into actions and choices, most of which they found boring.
-They always had max scores (21) for BANGS relatedness frustration and very low satisfaction.
-They clearly didn't feel they felt cared for in the games or had connections.
-Their interactions made them feel severely unwelcome and were toxic towards them.
+
+1 row of data, Neurotypical, 0 affective valence, 7 wemwbs, sat=3, frus=21 for all.
+Gaming sum avg=20, no impact is calculated at 20 (4 times 5).
+Played for average of 5 hours each day they played, largest binge is 810 minutes.
+This is only one out of their 4 waves they submitted (pid=p3011712557).
 
 The games they played need investigating.
 ```{r} 
-#| label: checking comp 1 games
+#| label: checking comp 2 games
 
-comp1_pid_info <- comp1_data |>
+comp2_pid_info <- comp2_data |>
   select(pid, wave, linked_platforms) |>
   left_join(wave_daily_telemetry, by = join_by(pid, wave)) |>
   select(
@@ -412,7 +649,7 @@ comp1_pid_info <- comp1_data |>
   distinct()
 
 # get dates valid for the wave
-comp1_games <- comp1_pid_info |>
+comp2_games <- comp2_pid_info |>
   # steam
   left_join(game_sessions, by = join_by(
     pid,
@@ -425,244 +662,545 @@ comp1_games <- comp1_pid_info |>
   ) |>
   select(-duration) |>
   distinct(pid, title_id, .keep_all = TRUE)
-```
 
-Game data reveals p3011712557 (neurotypical) had the largest of 2693.7 minutes played in wave 3.
-They played 9 days in this wave with very high gaming influence on social life.
-Max bangs rel frus, comp frus and auto frus.
-They played World and Tanks and Counter Strike 2 during the wave, which explains the high frustrations as they are competitive shooters.
-Participant p1219663417 had 3 waves of data (diagnosed ADHD.)
-Wave 1 showed they just played portal 2 (puzzle game) for 29 minutes across 2 days.
-BANGS rel frus (21), auto frus (19) and low satisfaction across highlights.
-Puzzle games are typically mentally-challenging and single player, so poor relatedness is expected.
-Poor autonomy is also expected -- a puzzle game won't let you continue till you complete the level.
-In wave 3 they played for 470 minutes across five days, playing role playing and beat-em-up games.
-Still believed they couldn't play as they wanted.
-they played for 2700 in wave 5 (CS2=1132 high binge 810, Hundred line=386, multiplayer casual total 280, elden ring 135).
-Participant p7842684564 played 1504 with binge 430.
-Mostly in Souce SDK (1241) and then Schedule 1 (144).
-Source SDK 2007 is a software development kit for creating mods for games on source engine.
-This is not a game as such, rather development/work.
-To summarise: the isolated component consists of participants with negative feelings towards the video games they have been playing, along with very low wemwbs and affective valence scores (outliers).
+comp2_games
+```
+Game data reveals the participant's data associated with this node played online multiplayer shooter games (world of tanks and counter strike) for majroity of the time.
+This explains the high frustrations as these are competitive games and can be toxic environments.
+
 
 ## Main Structure
 ```{r}
 #| label: main structure description
 
 main_nodes <- isolated_components |>
-  filter(component == 2) |>
+  filter(component == 1) |>
   pull(node)
 
 unique_rows <- unique(unlist(mapper_graph_data$points_in_vertex[c(main_nodes)]))
 main_data <- mapper_full_data[unique_rows, ]
-skimr::skim(main_data)
+
+row_node_lookup <- tibble(
+  node = seq_along(mapper_graph_data$points_in_vertex),
+  row_id = mapper_graph_data$points_in_vertex
+) |>
+  unnest_longer(row_id) |>
+  summarise(nodes = list(unique(node)), .by = "row_id")
+
+main_data <- main_data |>
+  mutate(row_id = row_number()) |>
+  left_join(row_node_lookup, by = "row_id") |>
+  select(-row_id)
+
+skim(main_data)
 ```
 
-The main structure consists of 72 nodes and more than 900 rows of data.
+The main structure consists of 90 nodes and 5669 rows of data.
 There are small tails on the end corners.
 There appears to be an increase in ADHD proportions at the corners.
 As demonstrated through the PCA correlations, we see positive experiences and wellbeing decrease as the the node size decreases.
 
+We will first examine the longest tail,
+which hints at being formed from low BANGS competence satisfaction scale and other low wellbeing scores.
+This hinted at from the mapper graph from before.
 
+### Long Tail
 
-## Old version: 30% overlap and less columns
-<!-- Component 2: 4 nodes 1 row -->
+This also includes the base of the tail, for better understanding.
+We can guess the tail is related to low scores on wellbeing and BANGS.
 ```{r}
-#| label: component 2
+#| label: long tail
 
-comp2_nodes <- isolated_components |>
-  filter(component == 2) |>
-  pull(node)
-unique_rows <- unique(unlist(mapper_graph_data$points_in_vertex[c(comp2_nodes)]))
-comp2_data <- mapper_full_data[unique_rows, ]
-glimpse(comp2_data)
-
-plot(
-  mapper_pca$x[, 1:2],
-  col = "black",
-  pch = 16,
-  cex = 0.6,
-  main = "Component 6 data highlight",
-  xlab = "PC1",
-  ylab = "PC2"
-)
-points(
-  mapper_pca$x[unique_rows, 1:2, drop = FALSE],
-  col = "red",
-  pch = 19,
-  cex = 1.2
-)
+tail_nodes <- c(49, 37, 27, 17)
+unique_tail_rows <- unique(unlist(mapper_graph_data$points_in_vertex[c(tail_nodes)]))
+tail_data <- mapper_full_data[unique_tail_rows, ] |> 
+  mutate(pid = as.factor(pid))
+skim(tail_data)
 ```
 
-The isolated component of 4 nodes consists of only one data point from the biweekly data.
-They are neurotypical, had their highest binge of wave 1 on a Tuesday.
-They played very little during the two weeks (234 minutes).
-As the total wemwbs score for someone saying "some of the time" to the positive questions is 22, they appear to have slightly lower wellbeing, but not noticeably.
-However, they say that gaming has an influce on their life (gaming_value_sum = 26) and is almost classed as an outlier based on the 1.5IQR rule.
-Switching to the gaming value colourisation shows this as red.
-They also show higher BANGS relatedness satisfaction (17), which is significantly higher than average.
-Despite not playing lots during the time, half their wave telemetry was in one session, and the participant felt a strong connection with the players/characters around them.
-As they play steam games, I want to check the metadata for this player, looking into what they generally play...
+This tail contains 33 rows of data.
+8 data points are from Diagnosed ADHD participants.
+The mean affective valence of the flare is 24, but has high variability (sd=20.4)
+The wemwbs scores are lower, but has one higher (27).
+50% of the tail has BANGS relatedness satisfaction less than or below 6.
+They also have low BANGS competence satisfaction.
+They experience very high frustration (remember: the average for a construct is 9) of mean values between 13 and 15.
 
-<!-- Component 3: 1 node 1 point -->
 ```{r}
-#| label: component 3
+#| label: checking tail games
 
-comp3_nodes <- isolated_components |>
-  filter(component == 3) |>
-  pull(node)
-unique_rows <- unique(unlist(mapper_graph_data$points_in_vertex[c(comp3_nodes)]))
-comp3_data <- mapper_full_data[unique_rows, ]
-glimpse(comp3_data)
-plot(
-  mapper_pca$x[, 1:2],
-  col = "black",
-  pch = 16,
-  cex = 0.6,
-  main = "Component 3 data highlight",
-  xlab = "PC1",
-  ylab = "PC2"
-)
-points(
-  mapper_pca$x[unique_rows, 1:2, drop = FALSE],
-  col = "red",
-  pch = 19,
-  cex = 1.2
-)
-```
-
-Another component is a singular node and data point.
-They are a very interesting case:
-low wemwbs (12), life satisfaction (2), affective valence (40), very high autonomy frustration (20), high competence satisfaction (20), very high relatedness frustration (21, the maximum value).
-They played a total of more than 1740 minutes in the two weeks (29 hours), with over 500 minutes in one session.
-Although only on instance and is not actually a high total telemetry, the long session highlights extreme hyperfocus.
-They also achieved a higher attention score of 68.
-The video game type needs to be checked; playing first person shooters may show higher relatedness frustration as players can experience toxic behaviour.
-
-```{r} 
-#| label: checking comp 3 games
-
-comp3_pid_info <- comp5_data |>
+tail_pid_info <- tail_data |>
   select(pid, wave, linked_platforms) |>
   left_join(wave_daily_telemetry, by = join_by(pid, wave)) |>
-  select(pid, wave, linked_platforms, wave_start_date = min_twoweek_date, wave_end_date = survey_date) |>
+  select(
+    pid, wave, linked_platforms,
+    wave_start_date = min_twoweek_date,
+    wave_end_date = survey_date
+  ) |>
   distinct()
 
 # get dates valid for the wave
-comp3_games <- steam |>
-  right_join(comp3_pid_info, by = join_by(
+tail_games <- tail_pid_info |>
+  # steam
+  left_join(game_sessions, by = join_by(
     pid,
-    approximate_session_start >= wave_start_date,
-    approximate_session_start < wave_end_date
+    wave_start_date <= session_start,
+    wave_end_date > session_end
   )) |>
-  group_by(title_id) |>
-  summarise(minutes_played = sum(minutes)) |>
-  ungroup() |>
-  left_join(metadata, by = join_by(title_id == original_name))
-glimpse(comp3_games)
-```
-This player spent all but one minute of their play time playing "Vampire Surivors", a role-playing survival game hunting vampires.
+  mutate(
+    minutes_played = sum(duration),
+    .by = c(pid, title_id)
+  ) |>
+  select(-duration) |>
+  distinct(pid, title_id, .keep_all = TRUE)
 
-<!-- Component 5: 1 node 1 row -->
+tail_games |> summarise(total_played = sum(minutes_played), .by = "primary_genre")
+```
+
+## Higher ADHD Proportions
+We highlight nodes 91, 85, and 78 as nodes among the general population with higher ADHD proportions.
+
 ```{r}
-#| label: component 5
+#| label: node 91
 
-comp5_nodes <- isolated_components |>
-  filter(component == 5) |>
-  pull(node)
-unique_rows <- unique(unlist(mapper_graph_data$points_in_vertex[c(comp5_nodes)]))
-comp5_data <- mapper_full_data[unique_rows, ]
-glimpse(comp5_data)
-plot(
-  mapper_pca$x[, 1:2],
-  col = "black",
-  pch = 16,
-  cex = 0.6,
-  main = "Component 5 data highlight",
-  xlab = "PC1",
-  ylab = "PC2"
-)
-points(
-  mapper_pca$x[unique_rows, 1:2, drop = FALSE],
-  col = "red",
-  pch = 19,
-  cex = 1.2
-)
+unique_node91_rows <- unique(unlist(mapper_graph_data$points_in_vertex[91]))
+node91_data <- mapper_full_data[unique_node91_rows, ] |> 
+  mutate(pid = as.factor(pid))
+skim(node91_data)
 ```
 
-There is another singular node and data point.
-They are a neurotypical participant and with their total telemetry (687) almost being their highest binge session (686) on a saturday.
-This also exhibits hyperfocus, an ADHD trait.
-But with very few sessions it does not mean they secretly have ADHD.
-They are the 75th percentile in wemwbs (high wellbeing) but have a very low affective valence (20) and life satisfaction (2).
-This is odd, and could be an input error.
-Gaming does not have a large influence on their social life.
-They experience very low satisfactions (3, 3, 3 for all) but also lower frustrations (9, 9 for comp rel).
-Interestingly, they have exceedingly high autonomy frustration.
-With such a large frustration, why do they have a large binge session of more than 11 hours?
-I need to check the game they played, and why the inputs to the survey are odd (just filling it out weirdly, although they didn't fail the check).
-
-<!-- Component 4: 3 nodes 2 rows -->
 ```{r}
-#| label: component 4
+#| label: node 85
 
-comp4_nodes <- isolated_components |>
-  filter(component == 4) |>
-  pull(node)
-unique_rows <- unique(unlist(mapper_graph_data$points_in_vertex[c(comp4_nodes)]))
-comp4_data <- mapper_full_data[unique_rows, ]
-glimpse(comp4_data)
-plot(
-  mapper_pca$x[, 1:2],
-  col = "black",
-  pch = 16,
-  cex = 0.6,
-  main = "Component 4 data highlight",
-  xlab = "PC1",
-  ylab = "PC2"
-)
-points(
-  mapper_pca$x[unique_rows, 1:2, drop = FALSE],
-  col = "red",
-  pch = 19,
-  cex = 1.2
-)
+unique_node85_rows <- unique(unlist(mapper_graph_data$points_in_vertex[85]))
+node85_data <- mapper_full_data[unique_node85_rows, ] |> 
+  mutate(pid = as.factor(pid))
+skim(node85_data)
 ```
 
-An isolated component with 3 nodes and 2 rows of data (from two different participants) contains one diagnosed ADHD participant.
-They are also from two different waves (2 and 3 diagnosed) and have differing wellbeings (20, 10 diagnosed).
-Diagnosed experienced extreme autonomy frustration, and very low satisfaction, but played a lot less than the neurotypical (477 total compared to 5007).
-However, their life satisfaction is low (3, 0 diagnosed) and their affective valence (40, 5 diagnosed).
-
-<!-- Component 6: 2 nodes 3 rows -->
 ```{r}
-#| label: component 6
-comp6_nodes <- isolated_components |>
-  filter(component == 6) |>
-  pull(node)
-unique_rows <- unique(unlist(mapper_graph_data$points_in_vertex[c(comp6_nodes)]))
-comp6_data <- mapper_full_data[unique_rows, ]
-glimpse(comp6_data)
-plot(
-  mapper_pca$x[, 1:2],
-  col = "black",
-  pch = 16,
-  cex = 0.6,
-  main = "Component 6 data highlight",
-  xlab = "PC1",
-  ylab = "PC2"
+#| label: node 78
+
+unique_node78_rows <- unique(unlist(mapper_graph_data$points_in_vertex[78]))
+node78_data <- mapper_full_data[unique_node78_rows, ] |> 
+  mutate(pid = as.factor(pid))
+skim(node78_data)
+```
+
+```{r}
+#| label: node 71
+
+unique_node71_rows <- unique(unlist(mapper_graph_data$points_in_vertex[71]))
+node71_data <- mapper_full_data[unique_node71_rows, ] |> 
+  mutate(pid = as.factor(pid), adhd = as.factor(adhd))
+skim(node71_data)
+```
+
+## ADHD bottom edge
+This section explores the bottom edge near the flare of ADHD proportions.
+This contains a small portion of data (min node size 1, max node size 13).
+We initially see:
+slightly higher attention scores,
+higher playtime and binge minutes (expected based on the nature of the filter functions),
+
+```{r}
+small_flare_nodes <- c(8, 18, 9, 19)
+unique_small_flare_rows <- unique(unlist(mapper_graph_data$points_in_vertex[small_flare_nodes]))
+small_flare_data <- mapper_full_data[unique_small_flare_rows, ] |> 
+  mutate(pid = as.factor(pid), adhd = as.factor(adhd))
+skim(small_flare_data)
+```
+
+How many participants are there in this area with ADHD?
+
+## Mobile telemetry
+Nodes 22 and 23 have the most.
+
+```{r}
+mobile_nodes <- c(22, 23)
+unique_mobile_rows <- unique(unlist(mapper_graph_data$points_in_vertex[mobile_nodes]))
+mobile_data <- mapper_full_data[unique_mobile_rows, ] |> 
+  mutate(pid = as.factor(pid), adhd = as.factor(adhd))
+skim(mobile_data)
+```
+
+## Small Flares
+We do see some little flares beginning:
+
+```{r}
+small_flares_nodes <- c(25, 26, 15, 16, 14, 5, 6)
+small_flares_rows <- unique(unlist(mapper_graph_data$points_in_vertex[small_flares_nodes]))
+small_flares_data <- mapper_full_data[small_flares_rows, ] |>
+  mutate(pid = as.factor(pid), adhd = as.factor(adhd))
+
+small_flares_pid_info <- small_flares_data |>
+  select(pid, wave, linked_platforms) |>
+  left_join(wave_daily_telemetry, by = join_by(pid, wave)) |>
+  select(
+    pid, wave, linked_platforms,
+    wave_start_date = min_twoweek_date,
+    wave_end_date = survey_date
+  ) |>
+  distinct()
+
+# get dates valid for the wave
+small_flares_games <- small_flares_pid_info |>
+  # steam
+  left_join(game_sessions, by = join_by(
+    pid,
+    wave_start_date <= session_start,
+    wave_end_date > session_end
+  )) |>
+  mutate(
+    minutes_played = sum(duration),
+    .by = c(pid, title_id)
+  ) |>
+  select(-duration) |>
+  distinct(pid, title_id, .keep_all = TRUE)
+
+small_flares_games |> summarise(total_played = sum(minutes_played), .by = "primary_genre")
+skim(small_flares_data)
+```
+
+Small flare of nodes 8, 9, 18, 19:
+
+```{r}
+second_flare_nodes <- c(8, 9, 18, 19)
+second_flare_rows <- unique(unlist(mapper_graph_data$points_in_vertex[second_flare_nodes]))
+second_flare_data <- mapper_full_data[second_flare_rows, ] |>
+  mutate(pid = as.factor(pid), adhd = as.factor(adhd))
+
+second_flare_pid_info <- second_flare_data |>
+  select(pid, wave, linked_platforms) |>
+  left_join(wave_daily_telemetry, by = join_by(pid, wave)) |>
+  select(
+    pid, wave, linked_platforms,
+    wave_start_date = min_twoweek_date,
+    wave_end_date = survey_date
+  ) |>
+  distinct()
+
+# get dates valid for the wave
+second_flare_games <- second_flare_pid_info |>
+  # steam
+  left_join(game_sessions, by = join_by(
+    pid,
+    wave_start_date <= session_start,
+    wave_end_date > session_end
+  )) |>
+  mutate(
+    minutes_played = sum(duration),
+    .by = c(pid, title_id)
+  ) |>
+  select(-duration) |>
+  distinct(pid, title_id, .keep_all = TRUE)
+
+second_flare_games |> summarise(total_played = sum(minutes_played), .by = "primary_genre")
+skim(second_flare_data)
+```
+
+# Visualisations
+
+```{r}
+#| label: generate any chosen graph
+
+configs <- tribble(
+  ~filename, ~data, ~legend_title,
+  "final_mapper_aff_val.pdf", mapper_data$aff_val, "Affective Valence",
+  "final_mapper_atten_score.pdf", mapper_data$atten_score_mean, "Simon attention task average",
+  "final_mapper_bangs_auto_sat.pdf", mapper_data$bangs_auto_sat, "BANGS Autonomy Satisfaction",
+  "final_mapper_bangs_comp_sat.pdf", mapper_data$bangs_comp_sat, "BANGS Competence Satisfaction",
+  "final_mapper_bangs_rel_frus.pdf", mapper_data$bangs_rel_frus, "BANGS Relatedness Frustration",
+  "final_mapper_bangs_rel_sat.pdf", mapper_data$bangs_rel_sat, "BANGS Relatedness Satisfaction",
+  "final_mapper_days_played.pdf", mapper_data$days_played, "No. days played videogames",
+  "final_mapper_gaming_value_sum.pdf", mapper_data$gaming_value_sum, "Videogame's real-world influence",
+  "final_mapper_max_session.pdf", mapper_data$max_binge_minutes, "Longest gaming session",
+  "final_mapper_mobile_telemetry.pdf", mapper_data$total_mobile_minutes, "Total mobile playtime (minutes)",
+  "final_mapper_nintendo_telemtry.pdf", mapper_data$total_nintendo_minutes, "Total Nintendo playtime (minutes)",
+  "final_mapper_xbox_telemetry.pdf", mapper_data$total_xbox_minutes, "Total Xbox playtime (minutes)",
+  "final_mapper_prop_action_adventure.pdf", mapper_full_data$prop_action_adventure, "Action & Adventure playtime proportion",
+  "final_mapper_prop_adventure.pdf", mapper_full_data$prop_adventure, "Adventure playtime proportion",
+  "final_mapper_prop_rpg.pdf", mapper_full_data$prop_role_playing_rpg, "Role-Playing (RPG) playtime proportion",
+  "final_mapper_prop_shooter.pdf", mapper_full_data$prop_shooter, "Shooter playtime proportion",
+  "final_mapper_prop_simulation.pdf", mapper_full_data$prop_simulation, "Simulation playtime proportion",
+  "final_mapper_prop_sports.pdf", mapper_full_data$prop_simulation, "Sports playtime proportion",
+  "final_mapper_total_wemwbs_total.pdf", mapper_data$wemwbs_total, "Total WEMWBS measure"
 )
-points(
-  mapper_pca$x[unique_rows, 1:2, drop = FALSE],
-  col = "red",
-  pch = 19,
-  cex = 1.2
+
+for (row in seq_len(nrow(configs))) {
+  filename <- configs$filename[row]
+  colour_data <- configs$data[[row]]
+  title <- configs$legend_title[row]
+  
+  if (generate_pdf_figs) pdf(paste("mapper_analysis_figs", filename, sep = "/"))
+  set.seed(2)
+  create_mapper_graph(
+    mapper_obj = mapper_graph_data,
+    colourisation = colour_data,
+    original_data = mapper_data,
+    graph_layout = layout_with_fr,
+    legend = TRUE,
+    legend_title = title,
+    legend_tick_num = 5
+  )
+  if (generate_pdf_figs) dev.off()
+}
+```
+
+# Descriptive Statistics
+
+```{r}
+#| label: descriptive statistics
+
+library(scales)
+
+# telemetry distributions
+telemetry_cols <- c(
+  "total_wave_minutes", "total_steam_minutes",
+  "total_xbox_minutes", "total_mobile_minutes",
+  "total_nintendo_minutes", "max_binge_minutes",
+  "days_played"
+)
+
+telemetry_labels <- c(
+  total_mobile_minutes = "Mobile Playtime (min)",
+  total_nintendo_minutes = "Nintendo Playtime (min)",
+  total_steam_minutes = "Steam Playtime (min)",
+  total_xbox_minutes = "Xbox Playtime (min)",
+  total_wave_minutes = "Total Wave Playtime (min)",
+  days_played = "Days Active",
+  max_binge_minutes = "Longest Session (min)"
+)
+
+telemetry_long <- mapper_full_data |>
+  pivot_longer(
+    cols = all_of(telemetry_cols),
+    names_to = "metric",
+    values_to = "value"
+  )
+
+ggplot(telemetry_long, aes(x = value, fill = adhd, colour = adhd)) +
+  geom_density(alpha = 0.25, linewidth = 0.45) +
+  facet_wrap(
+    vars(metric),
+    scales = "free",
+    labeller = as_labeller(telemetry_labels, default = label_value)
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(
+    x = NULL,
+    y = "Density",
+    fill = "ADHD Status",
+    colour = "ADHD Status"
+  ) +
+  theme(
+    # bottom legend
+    legend.position = "bottom",
+    legend.box.margin = margin(t = -4, b = 0),
+    legend.margin = margin(0, 0, 0, 0),
+    legend.title = element_text(face = "bold", size = 7.5),
+    legend.text = element_text(size = 7),
+    legend.key.size = unit(0.35, "cm"),
+    legend.background = element_blank()
+  )
+```
+
+```{r}
+#| label: statistically testing adhd max_binge_minutes
+
+library(rstatix)
+library(dunn.test)
+
+desc_summary <- mapper_full_data |>
+  group_by(adhd) |>
+  summarise(
+    N = n(),
+    Median = median(max_binge_minutes, na.rm = TRUE),
+    IQR = IQR(max_binge_minutes, na.rm = TRUE),
+    Mean = mean(max_binge_minutes, na.rm = TRUE),
+    SD = sd(max_binge_minutes, na.rm = TRUE),
+    .groups = "drop"
+  )
+print(desc_summary)
+
+# non-parametric test
+kw_test <- kruskal.test(max_binge_minutes ~ adhd, data = mapper_full_data)
+print(kw_test)
+
+# effect Size (eta-squared for Kruskal-Wallis)
+kw_eff <- mapper_full_data |> 
+  kruskal_effsize(max_binge_minutes ~ adhd)
+print(kw_eff)
+
+# post-hoc pairwise comparisons (Dunn's Test with Holm-Bonferroni Correction)
+posthoc_dunn <- dunn.test(
+  x = mapper_full_data$max_binge_minutes,
+  g = mapper_full_data$adhd,
+  method = "holm",
+  kw = FALSE
 )
 ```
-Another component contains just 2 nodes but three participants (one is self-identified ADHD).
-Two are from the second wave, and one from the sixth.
-They have varied affective valence (40, 59, 80) and BANGS.
-However, they have consistent attention scores (the self-identified participant has the attention score in the middle).
-Two of the total wave minutes are similar (1830, 1787) but one is significantl lower (363).
-I cannot find a pattern between the three data points, so I wonder if this is the limitation of using PCA with limited variance.
-Looking at the rotations, I don't see any reason for these data points to be clustered together.
+
+```{r}
+#| label: wellbeing plot
+
+wellbeing_cols <- c(
+  "aff_val", "wemwbs_total",
+  "bangs_auto_sat", "bangs_auto_frus",
+  "bangs_comp_sat", "bangs_comp_frus",
+  "bangs_rel_sat", "bangs_rel_frus",
+  "gaming_value_sum"
+)
+wellbeing_labels <- c(
+  aff_val = "Affective Valence",
+  wemwbs_total = "Total WEMWBS",
+  bangs_auto_sat = "BANGS Autonomy Satisfaction",
+  bangs_auto_frus = "BANGS Autonomy Frustration",
+  bangs_comp_sat = "BANGS Competence Satisfaction",
+  bangs_comp_frus = "BANGS Competence Frustration",
+  bangs_rel_sat = "BANGS Relatedness Satisfaction",
+  bangs_rel_frus = "BANGS Relatedness Frustration",
+  gaming_value_sum = "Gaming real-world influence"
+)
+wellbeing_long <- mapper_full_data |>
+  pivot_longer(
+    cols = all_of(wellbeing_cols),
+    names_to = "metric",
+    values_to = "value"
+  )
+
+ggplot(wellbeing_long, aes(x = value, fill = adhd, colour = adhd)) +
+  geom_density(alpha = 0.25, linewidth = 0.45) +
+  facet_wrap(
+    vars(metric),
+    scales = "free",
+    labeller = as_labeller(wellbeing_labels, default = label_value)
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(
+    x = NULL,
+    y = "Density",
+    fill = "ADHD Status",
+    colour = "ADHD Status"
+  ) +
+  theme(
+    # bottom legend
+    legend.position = "bottom",
+    legend.box.margin = margin(t = -4, b = 0),
+    legend.margin = margin(0, 0, 0, 0),
+    legend.title = element_text(face = "bold", size = 7.5),
+    legend.text = element_text(size = 7),
+    legend.key.size = unit(0.35, "cm"),
+    legend.background = element_blank()
+  )
+```
+
+```{r}
+#| label: statistically testing adhd wellbeing
+
+library(rstatix)
+library(dunn.test)
+
+test_cols <- c("aff_val", "bangs_auto_frus", "bangs_comp_frus", "bangs_rel_sat", "wemwbs_total")
+summary_list <- list()
+kw_results   <- list()
+dunn_results <- list()
+
+for (col in test_cols) {
+  cat("\n=======================================================\n")
+  cat("VARIABLE:", col, "\n")
+  cat("=======================================================\n")
+  
+  desc_summary <- mapper_full_data |>
+    group_by(adhd) |>
+    summarise(
+      Variable = col,
+      N        = sum(!is.na(.data[[col]])),
+      Median   = median(.data[[col]], na.rm = TRUE),
+      IQR      = IQR(.data[[col]], na.rm = TRUE),
+      Mean     = mean(.data[[col]], na.rm = TRUE),
+      SD       = sd(.data[[col]], na.rm = TRUE),
+      .groups  = "drop"
+    )
+  print(desc_summary)
+  summary_list[[col]] <- desc_summary
+  
+  form <- as.formula(paste(col, "~ adhd"))
+  kw_test <- kruskal.test(form, data = mapper_full_data)
+  print(kw_test)
+  
+  kw_eff <- mapper_full_data |> 
+    kruskal_effsize(formula = form)
+  print(kw_eff)
+  
+  kw_results[[col]] <- tibble(
+    variable = col,
+    chi2 = kw_test$statistic,
+    df = kw_test$parameter,
+    p_value = kw_test$p.value,
+    effsize = kw_eff$effsize,
+    magnitude = kw_eff$magnitude
+  )
+  
+  cat("\n--- Dunn's Post-Hoc Comparisons (Holm-adjusted) ---\n")
+  posthoc_dunn <- dunn.test(
+    x      = mapper_full_data[[col]],
+    g      = mapper_full_data$adhd,
+    method = "holm",
+    kw     = FALSE
+  )
+  dunn_results[[col]] <- posthoc_dunn
+}
+
+all_descriptives <- bind_rows(summary_list)
+all_kw_tests <- bind_rows(kw_results)
+```
+
+# Latex Tables/Figures
+
+```{r}
+# descriptive statistics of intake participants
+library(kableExtra)
+library(modelsummary)
+library(estimatr)
+
+options(modelsummary_factory_default = "kableExtra")
+options(knitr.table.format = "latex")
+
+summary_stat_data <- intake_participants |>
+  select(
+    adhd,
+    `Age (years)` = age,
+    `Height (cm)` = height,
+    `Weight (kg)` = weight,
+    `Country` = country,
+    `Highest Education Level` = edu_level,
+    `Employment Status` = employment
+  )
+
+summary_table <- datasummary_balance(
+  ~ adhd,
+  data = summary_stat_data,
+  fmt = 2,
+  dinm = FALSE,
+  output = "data.frame",
+)
+
+latex_code <- kbl(
+  summary_table,
+  format    = "latex",
+  booktabs  = TRUE,
+  linesep   = "",
+  caption   = "Participant Demographic and Baseline Characteristics",
+  align     = c("l", "l", rep("r", ncol(summary_table) - 2))
+) |>
+  add_header_above(c(
+    " " = 2,
+    "Diagnosed ADHD (N=331)" = 2,
+    "Neurotypical (N=1475)" = 2,
+    "Self-Identified ADHD (N=172)" = 2
+  )) |>
+  kable_styling(latex_options = c("hold_position", "scale_down"))
+
+# writeLines(as.character(latex_code), "participant_summary_stats.tex")
+```

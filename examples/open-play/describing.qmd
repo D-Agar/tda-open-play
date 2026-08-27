@@ -43,9 +43,9 @@ steam <- read_csv("data/open-play/clean/steam.csv.gz")
 steam_visibility <- read_csv(
   "data/open-play/raw/telemetry_steam_account_linking_raw.csv.gz"
 )
-biweekly <- read_csv("data/open-play/clean/biweekly.csv.gz")
-daily <- read_csv("data/open-play/clean/daily.csv.gz", guess_max = 10000)
-intake <- read_csv("data/open-play/clean/intake.csv.gz", guess_max = 34000)
+biweekly <- read_csv("data/open-play/clean/survey_biweekly.csv.gz")
+daily <- read_csv("data/open-play/clean/survey_daily.csv.gz", guess_max = 10000)
+intake <- read_csv("data/open-play/clean/survey_intake.csv.gz", guess_max = 34000)
 time_use <- read_csv("data/open-play/clean/timeuse.csv.gz") |>
   filter(quality_flag == "Good quality")
 xbox <- read_csv("data/open-play/clean/xbox.csv.gz")
@@ -59,7 +59,7 @@ biweekly_raw <- read_csv(
 time_use_raw <- read_csv("data/open-play/raw/timeuse_raw.csv.gz")
 
 intake_participants <- read_csv(
-  "data/open-play/clean/intake_participant.csv.gz"
+  "data/open-play/clean/survey_intake_participants_final.csv.gz"
 )
 ```
 
