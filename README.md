@@ -3,4 +3,5 @@ Specifically, we explore mental wellbeing and the fulfilment games bring,
 to people with varying levels of attention deficit hyperactivity disorder (ADHD).
 
 Previous work reproducing academic research that utilise Mapper are also found here (under examples),
-as well as attempting to implement the Mapper algorithm from scratch in R.
+as well as attempt to implement the Mapper algorithm from scratch in R.
+![Final Mapper Graph](./final-mapper-image.jpg)
