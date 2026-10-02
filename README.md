@@ -4,4 +4,4 @@ to people with varying levels of attention deficit hyperactivity disorder (ADHD)
 
 Previous work reproducing academic research that utilise Mapper are also found here (under examples),
 as well as attempt to implement the Mapper algorithm from scratch in R.
-![Final Mapper Graph](./final-mapper-image.jpg)
+![Final Mapper Graph](./more_telem_pca12_final_covextension_int10_ov40_dbscan_eps3_minPts5_page-0001.jpg)
